@@ -1,5 +1,26 @@
 # NVIDIA / CUDA support — status
 
+## Jetson Orin Nano bring-up
+
+Jetson support is not yet claimed or benchmarked. Before attempting inference on
+an Orin Nano, capture a machine-readable capability report with the read-only
+probe:
+
+```bash
+EDGE0_BACKEND=cuda python scripts/jetson_probe.py \
+  --model-dir "$EDGE0_8B_MODEL" \
+  --output artifacts/orin-probe.json
+```
+
+The command exits non-zero and lists actionable blockers when it cannot confirm
+a Jetson Orin, CUDA-enabled PyTorch, and NVMe-backed model storage. It reports
+facts only; passing the probe does not imply that inference fits in 8 GB.
+
+The staged implementation and measurement gates are documented in
+[`docs/plans/jetson-orin-nano.md`](plans/jetson-orin-nano.md). Start with the
+8B tier and retain the existing correctness path while optimizing memory and
+I/O.
+
 `edge0` does **not** run on NVIDIA through MLX, at any version tested:
 the first forward pass fails, differently at each version (the table
 below). It does run on NVIDIA through the torch backend in
