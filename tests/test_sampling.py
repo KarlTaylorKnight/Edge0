@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import mlx.core as mx
 import pytest
 
-from edge0.sampling import _mask_logits, sample
+mx = pytest.importorskip("mlx.core")
+
+from edge0.sampling import _mask_logits, sample  # noqa: E402
 
 
 def test_mask_identity_for_sane_kwargs():

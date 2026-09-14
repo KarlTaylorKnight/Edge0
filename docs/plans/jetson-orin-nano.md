@@ -141,6 +141,36 @@ Capture `tegrastats` beside the run, from before loading until cleanup, with int
 
 If inference fails, preserve its stage, configuration, available diagnostic evidence and exit status. OOM diagnostics may not reveal an exact failing allocation, especially for an OS kill; state unknown when necessary. Reducing context or generation produces a new workload, so retain both results. If default inference cannot fit, a documented failed attempt permits a bounded-memory correction in Task 4; establish a successful reference baseline before asynchronous or kernel optimization.
 
+**Status (14 September 2026, on the physical device):** executed on an
+Orin Nano Developer Kit (Super) 8 GB, L4T R39.2, CUDA 13.2 driver,
+25W mode, NVMe.  Gate A: validated venv (Python 3.12.3, official torch
+2.14.0+cu130 aarch64 wheel — the GB10 combination; edge0 installed
+`--no-deps`, no MLX on device; `torch.nn.RMSNorm`, `torch.uint32`,
+tokenizer imports and CUDA kernel execution verified).  The wheel warns
+`sm_87` is outside its SASS list; execution evidence, not the warning,
+was used as the gate.  Probe: `ready: true`, no blockers.
+`tests/test_torch_cuda_smoke.py` + `tests/conftest.py` (`--require-cuda`)
+added: 6/6 pass on device; hard-fail contract verified with
+`CUDA_VISIBLE_DEVICES=""`.  `scripts/orin_reference_check.py` added
+(CUDA greedy vs torch-CPU teacher-forced logits, tolerances registered
+in the script before the run): 32/32 token choices identical, no
+near-ties consumed; the pre-registered vocab-wide logit bound (1.0)
+was exceeded (max |Δ| 2.06, tail-token bfloat16 noise — ≤ 0.22 at every
+step's top-8 tokens; analysis retained in the evidence set).  Recorded
+as a FAIL of that bound, not loosened retroactively; a top-k-scoped
+criterion is proposed for review before the next comparison run, and
+MLX fixtures remain the intended reference.  Short baseline: three
+independent launches × two runs (`--ntok 32 --warmup 0`, temp 0, seed 0,
+weight cache and prewarm off, tegrastats alongside): decode 0.53–0.58
+tok/s (mean 0.55), prefill 11.3–15.9 s at 37 prompt tokens, CUDA
+allocator peak ≤ 1.00 GiB, process peak RSS 5.3–5.8 GiB, GPU 99%
+utilized, no OOM/swap.  Raw JSON reports, npz logit captures and
+tegrastats logs live in the untracked `$EDGE0_RUN_DIR` evidence set;
+sanitized summary in `docs/nvidia.md`.  Task 4's profiling starts from
+this baseline; the dominant cost is per-call expert dequantization in
+`gather_qmm` (GB10 already measured 2.5× from the weight cache that
+Task 4's byte budget must first make safe to enable here).
+
 ## Task 4 — memory-budgeted profile [C11]
 
 Implement the pure budget calculation first, then integrate at existing configuration/cache-construction points. Inspect `models/base.py`, the 8B configuration, `streaming/install.py`, `streaming/cache.py` and `streaming/layer.py`; the CUDA backend namespace alone cannot enforce the profile.

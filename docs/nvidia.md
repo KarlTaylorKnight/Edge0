@@ -2,9 +2,16 @@
 
 ## Jetson Orin Nano bring-up
 
-Jetson support is not yet claimed or benchmarked. Before attempting inference on
-an Orin Nano, capture a machine-readable capability report with the read-only
-probe:
+**Status (14 September 2026): edge0-8b runs on a physical Orin Nano 8 GB.**
+The unoptimized torch reference path generated coherent 32-token greedy
+output on the device's GPU, with every token choice identical to the
+torch-CPU reference on the same board.  The claim is qualified to the
+tested workload (37-token chat-templated prompt, 32 greedy tokens,
+weight cache and prewarm off) and to what the correctness gate below
+actually shows — see [Task 3 baseline](#task-3-orin-baseline-summary).
+
+Before attempting inference on an Orin Nano, capture a machine-readable
+capability report with the read-only probe:
 
 ```bash
 EDGE0_BACKEND=cuda python scripts/jetson_probe.py \
@@ -21,8 +28,71 @@ The staged implementation and measurement gates are documented in
 justifications in [`jetson-orin-nano-review.md`](plans/jetson-orin-nano-review.md)).
 Start with the 8B tier and retain the existing correctness path while
 optimizing memory and I/O. The benchmark's machine-readable report, which the
-Orin baseline will use, is described in [Benchmark reporting](#benchmark-reporting)
+Orin baseline uses, is described in [Benchmark reporting](#benchmark-reporting)
 below.
+
+### Task 3 Orin baseline summary
+
+Target: Jetson Orin Nano Developer Kit (Super), 8 GB (7.85 GB observed),
+NVMe/ext4, L4T R39.2 (kernel 6.8.12-tegra), 25W power mode (observed, not
+changed), Python 3.12.3.  Torch: the official **2.14.0+cu130 aarch64
+wheel** — the same build the GB10 work used.  It warns that its SASS list
+excludes `sm_87`; empirically the `sm_80` binaries run on this Orin
+(CC 8.x binary compatibility), and the smoke suite below is the evidence
+gate that decides this, not the warning or the docs.  Environment:
+edge0 installed `pip install -e . --no-deps` plus
+numpy/safetensors/tokenizers/psutil/transformers (5.17.0) — no MLX
+package on the device; the 8B torch import path needs none.
+
+Evidence chain (raw reports in the untracked evidence set, sanitized
+summary here):
+
+* **Probe** (`scripts/jetson_probe.py --model-dir …`): `ready: true`,
+  no blockers; checkpoint manifest sha256 `a83dee78…` (48 files,
+  4.60 GB).
+* **CUDA acceptance** — `pytest tests/test_torch_cuda_smoke.py
+  --require-cuda -q`: 6/6 pass on the device (matmul vs float64
+  reference, packed-uint32 int4 `gather_qmm` vs a hand-computed
+  dequantization, RMSNorm, unsigned-word view semantics, core ops).
+  The suite FAILS rather than skips when CUDA is missing (verified
+  with `CUDA_VISIBLE_DEVICES=""`).
+* **32-token greedy correctness** (`scripts/orin_reference_check.py`,
+  CUDA generation vs torch-CPU teacher-forced logits; torch-CPU is the
+  path checked against MLX layer-by-layer on the GB10): **32/32 token
+  choices identical, zero near-ties consumed** (smallest top-1→top-2
+  margin 0.067, median 4.6).  The pre-registered vocab-wide logit
+  bound (max |Δ| ≤ 1.0) was **exceeded: max |Δ| = 2.06** — reported as
+  the FAIL it is, not re-run with a looser bound.  Post-hoc analysis
+  (recorded in the evidence set): median |Δ| 0.087, p99 0.52; every
+  excursion above 1.0 sits on deep-tail tokens (worst: reference rank
+  429); at the reference's top-8 tokens of every step the difference
+  is ≤ 0.22.  This is accumulated bfloat16 reduction-order noise, not
+  a kernel defect; a top-k-scoped logit criterion should be registered
+  in review before the next comparison run, and MLX-generated fixtures
+  remain the intended reference once available.
+* **Short baseline** (`BENCH_TEMP=0 BENCH_SEED=0 examples/bench.py
+  edge0-8b --ntok 32 --warmup 0`, probe linked, tegrastats at 1 s
+  alongside, three independent process launches, two internal runs
+  each, `EDGE0_TORCH_WEIGHT_CACHE=0 EDGE0_PREWARM=0`):
+
+  | Launch | Prefill (37 tok) | Decode (32 tok) | CUDA alloc peak | Peak RSS |
+  |---|---|---|---|---|
+  | 1 | 15.9 / 11.7 s | 0.53 / 0.55 tok/s | 0.92 / 1.00 GiB | 5.31 GiB |
+  | 2 | 13.4 / 11.4 s | 0.55 / 0.55 tok/s | 0.92 / 1.00 GiB | 5.69 GiB |
+  | 3 | 14.9 / 13.2 s | 0.56 / 0.58 tok/s | 0.92 / 1.00 GiB | 5.76 GiB |
+
+  Six runs, descriptive statistics: decode mean **0.55 tok/s** (min
+  0.53, max 0.58); engine build ~11.4 s.  GPU utilization pegged at
+  99% during decode (tegrastats); no OOM, no swap activity; RSS and
+  CUDA peaks are separate views (unified memory — RSS includes
+  touched mmapped expert pages) and are not added.  A desktop session
+  (~3.5 GB) was resident throughout — headroom, not a guarantee.
+
+This is the **unoptimized reference implementation**: `gather_qmm`
+dequantizes every gathered expert on every call, exactly the cost
+Tasks 4–6 of the plan exist to remove (the GB10 measured 2.5× from the
+dequantized-weight cache alone; it is off here pending Task 4's byte
+budget).  Do not read 0.55 tok/s as the platform's capability.
 
 ## Benchmark reporting
 
