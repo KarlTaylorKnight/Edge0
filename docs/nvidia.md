@@ -17,9 +17,147 @@ a Jetson Orin, CUDA-enabled PyTorch, and NVMe-backed model storage. It reports
 facts only; passing the probe does not imply that inference fits in 8 GB.
 
 The staged implementation and measurement gates are documented in
-[`docs/plans/jetson-orin-nano.md`](plans/jetson-orin-nano.md). Start with the
-8B tier and retain the existing correctness path while optimizing memory and
-I/O.
+[`docs/plans/jetson-orin-nano.md`](plans/jetson-orin-nano.md) (change
+justifications in [`jetson-orin-nano-review.md`](plans/jetson-orin-nano-review.md)).
+Start with the 8B tier and retain the existing correctness path while
+optimizing memory and I/O. The benchmark's machine-readable report, which the
+Orin baseline will use, is described in [Benchmark reporting](#benchmark-reporting)
+below.
+
+## Benchmark reporting
+
+`examples/bench.py` keeps its two-run protocol and its human-readable output
+and can additionally write a machine-readable report:
+
+```bash
+EDGE0_BACKEND=cuda EDGE0_TORCH_DEVICE=cuda \
+  python examples/bench.py edge0-8b --ntok 32 --warmup 0 \
+  --probe-json "$EDGE0_RUN_DIR/orin-probe.json" \
+  --json-output "$EDGE0_RUN_DIR/orin-short-baseline.json"
+```
+
+The pure builder (`examples/benchmark_report.py`, standard library only,
+imports neither torch nor MLX) turns measured numbers into the schema; the
+benchmark-owned collectors (`examples/benchmark_measure.py`) talk to the
+backend, the process and the machine behind lazy, injectable imports.
+
+### What is measured
+
+* **Protocol** `fixed-length-sample-and-step`, version 1. Per run:
+  `engine.reset()`, a timed chat-templated prefill, `--warmup` **greedy**
+  (argmax) steps that are not timed, then `--ntok` timed iterations of "sample
+  one token from the current logits, run one engine step". The final step's
+  logits are computed but never sampled and the loop does not stop at EOS.
+  None of the numbers is a time-to-first-token or an EOS-aware completion
+  latency; the report's `protocol` block says so.
+* **Counts** per run: `prompt_tokens` (after chat templating),
+  `warmup_tokens`, `timed_decode_tokens`,
+  `total_generated_tokens = warmup + timed`,
+  `decode_start_context_tokens = prompt + warmup`; the requested counts are
+  kept separately (`requested_*`). `decode_tokens_per_second` divides the
+  timed tokens only. A zero measured duration gives `null` plus a reason,
+  never a zero rate; `--ntok 0` is refused.
+* **Wall time** is `time.perf_counter()` and includes storage, transfer and
+  CPU sampling costs by design. On an actual CUDA device (`EDGE0_BACKEND=cuda`
+  *and* a resolved `cuda` device; `EDGE0_TORCH_DEVICE=cpu`/`mps` is not one)
+  the benchmark calls `torch.cuda.synchronize(device)` after the engine reset,
+  at the end of prefill, at the end of warmup and after the final timed step:
+  phase boundaries only, no per-token synchronization. On MLX nothing changes,
+  the engine's `core.eval(logits)` already materializes every step. Torch on
+  `mps` is not synchronized by the benchmark (the plan mandates CUDA only), so
+  its wall times may exclude the final step's in-flight device work; the
+  report says so in `runtime.measurement.synchronization`.
+* **Memory** is integer bytes everywhere, each value with its `method` and
+  `scope`. Per run (`runs[i].memory`): `cuda_peak_allocated` from the torch
+  caching allocator, reset immediately before prefill and read after the
+  synchronized decode. It covers prefill + warmup + decode, includes whatever
+  was resident at the reset (recorded as `allocated_at_reset`), does not
+  recover an earlier load transient and does not see the CUDA context,
+  driver or non-torch memory. `cuda_peak_reserved` is recorded next to it
+  with its own scope: `reset_peak_memory_stats` does not drop the reserved
+  peak below the segments the allocator already holds, so its floor is every
+  segment cached at the reset (`reserved_at_reset`) and run 0 and run 1 are
+  expected to be close. The headline value (the human `peak_active` line and
+  the legacy `peak_gib`) is `cuda_peak_allocated`, the analogue of MLX's peak
+  active memory; `runtime.measurement.headline_peak` names it. On MLX the
+  same reset point feeds `mlx_peak_active` (`mlx.core.get_peak_memory`); for
+  torch on any non-CUDA device (cpu, mps) the per-run `backend_peak` is
+  `null` with the reason. Process-wide (`memory`): `process_peak_rss`, a
+  lifetime high-water mark (`ru_maxrss`; `peak_wset` on Windows) that
+  includes model load and every run, and the sampled peaks from a sampler
+  thread started before the model loads (`--rss-sample-interval`, default
+  0.25 s, `0` disables; spikes shorter than the interval are missed):
+  `process_sampled_peak_rss`, plus on Linux (`/proc/self/status`)
+  `process_sampled_peak_rss_anon`, `process_sampled_peak_rss_file` and
+  `process_sampled_peak_swap`. Resident set size counts the resident
+  file-backed pages of the mmap'd checkpoint (whole-layer prefill touches
+  every expert of `model.safetensors`, reclaimable page cache) together with
+  anonymous memory, so it is not the process's anonymous footprint and not
+  comparable to the "peak anonymous memory" figure further down this page;
+  the `*_rss_anon` peak is. A non-zero swap peak marks a swapping run, which
+  cannot establish a resident-memory target. RSS and allocator peaks are
+  separate views of the same shared DRAM on Jetson; never add them.
+* **Unavailable values** are `null` with a reason: every data group
+  (`identity`, `model`, `runtime`, `workload`, `caches`, `memory`, `probe`,
+  each entry of `runs[]`, each statistic block of `summary` and every nested
+  object that can hold a null) carries an `unavailable_reasons` map
+  (`{field: reason}`), and memory metric objects carry `unavailable_reason`;
+  `protocol` and the `summary` container hold no nullable fields. An invalid *required* measurement (negative or
+  non-finite timing, count or byte value) aborts the run instead of being
+  written. Serialization is strict JSON (`allow_nan=False`).
+
+### Report layout (`schema_version` 1, independent of the probe's schema)
+
+| Group | Contents |
+|---|---|
+| `protocol` | name, version and the labels above |
+| `identity` | start/finish timestamps, git commit and tracked-file dirty flag of this checkout (untracked files do not count), `run_count`, `command.argv`, the requested `BENCH_*` / `EDGE0_*` / `MLX_CACHE_LIMIT_MB` / `LING_HIDDEN_CLIP` / `LING_PREWARM` / `PREROUTER_*` knobs as raw strings, snapshotted before the engine is built (the 8B engine sets a default `LING_HIDDEN_CLIP` the user did not request), the requested arguments |
+| `model` | resolved local checkpoint path, tier, `model_type` / `architectures`, `config.json` SHA-256, the checkpoint manifest (`files`: every regular file's relative path and size, `algorithm`, and the `sha256` over that list, so the digest is reproducible from the retained list; weights are never content-hashed), SHA-256 of every non-weight file up to 32 MiB (config, chat template, `tokenizer.json`, vocab, merges), safetensors header metadata, tensor counts and header hashes, `tokenizer_files` (name, size, SHA-256), and the LoRA / prerouter adapters as the engine resolved them (`engine.cfg`, which may point at the repo's `artifacts/` fallback rather than the checkpoint directory: path, whether it is inside the checkpoint directory, size, SHA-256 up to 256 MiB, header metadata, r/alpha and prerouter settings) |
+| `runtime` | backend and version, resolved device, the measurement adapter's description (synchronization policy, peak source, `headline_peak`), execution evidence (class and device of the logits the engine produced), Python / torch / CUDA or MLX versions, platform, Jetson power mode (`nvpmodel -q`, else the nvpmodel status file, else a reason) |
+| `workload` | prompt source, SHA-256 of the prompt text, SHA-256 of the prompt token ids after chat templating (`prompt_token_ids_sha256`: two launches are the same workload only if prompt digest, token count and token-id digest all match), length, text and token count; requested counts; resolved seed, temperature, top-k, top-p, repetition penalty, prefill chunk and think flag; `model_env`, the model-read knobs resolved after the build exactly as the bailing_hybrid code parses them (`ling_hidden_clip`, `prerouter_feature_topk`, `prerouter_intra`), which change numerics and per-token work and must be equal on both sides of a comparison |
+| `caches` | resolved `LayerOptions`, the actual shared-LRU and prefetch capacities read from the installed streaming layers, `weight_cache` (the torch backend's resolved `EDGE0_TORCH_WEIGHT_CACHE`), `prewarm` (the requested `EDGE0_PREWARM` / `LING_PREWARM` flag; only the 8B engine honors it), thread settings, the MLX cache limit, streaming statistics after the runs |
+| `runs[]` | per-run counts, `prefill_seconds` / `prefill_tokens_per_second`, `decode_seconds` / `decode_tokens_per_second`, per-run memory metrics, execution evidence |
+| `summary` | per metric: `n`, `n_valid`, the per-run `values` (nulls kept in run order), mean, min, max and sample standard deviation over the runs that have a value (null with a reason when none has one; the standard deviation needs two); descriptive only, two sequential runs in one process are not independent launches |
+| `memory` | the process-lifetime RSS peak and the sampled RSS / anonymous / file-backed / swap peaks, with notes |
+| `probe` | with `--probe-json`: the probe's own `schema_version`, the SHA-256 of the file as read, its `ready` flag, its timestamp and local path |
+
+### Safety rails
+
+* `--json-output` must be a new path. An existing destination, an invalid
+  `--probe-json` (missing, not JSON, no integer `schema_version`),
+  `--ntok <= 0` (also via `BENCH_NTOK`), `--warmup < 0`, a non-integer
+  `BENCH_SEED` or a non-numeric `BENCH_TEMP` are rejected **before** the model
+  loads, and none of that needs a backend: `bench.py` imports the framework
+  lazily, so `--help` and the argument checks work on a host without torch
+  or MLX. `BENCH_SEED=0` is a seed (both runs re-seed with it right after
+  prefill); at `BENCH_TEMP=0` the sampler is greedy, so the output does not
+  depend on the seed even though it is recorded. A tier name resolves to
+  `EDGE0_<TIER>_MODEL` by the same rule as the CLI.
+* The report is written atomically (temporary file in the destination
+  directory, fsync, then linked or renamed into place without ever
+  overwriting an existing file). A failed engine build, benchmark, report
+  assembly or write exits non-zero, prints `[bench] FAILED during <stage>` and
+  leaves no report at the destination; the engine and the sampler are closed
+  in `finally` either way.
+* The human output is unchanged, except that `peak_active` prints `n/a` when
+  the backend peak is unavailable and measured CUDA numbers now include the
+  synchronized device work.
+* Keep the JSON outside tracked source: it records local paths and the prompt
+  text. Share sanitized summaries and evidence digests.
+
+### What this does and does not show
+
+`tests/test_benchmark_report.py`, `tests/test_benchmark_measure.py` and
+`tests/test_bench_cli.py` validate the instrumentation with a fake engine, a
+fake array namespace and fake device APIs: dispatch, synchronization order,
+count arithmetic, units, pre-load validation, failure paths and cleanup. They
+run on a host with neither torch nor MLX. `tests/test_bench_backend.py`
+repeats the core cases through the real `core` ops and sampler of whichever
+backend is importable (on a host without MLX it selects the torch backend on
+the CPU unless the environment already chose otherwise) and is skipped when
+there is none. None of this is CUDA or Orin evidence. The Orin baseline
+(Task 3 of the plan) needs the physical device, a validated environment and
+the probe.
 
 `edge0` does **not** run on NVIDIA through MLX, at any version tested:
 the first forward pass fails, differently at each version (the table

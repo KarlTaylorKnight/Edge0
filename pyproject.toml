@@ -50,6 +50,10 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# tests import repo-root packages (``from scripts import jetson_probe``,
+# ``from examples import bench``); put the root on sys.path for the plain
+# ``pytest`` invocation too, not only for ``python -m pytest``.
+pythonpath = ["."]
 markers = [
     "slow: real-weight e2e tests (skip with -m 'not slow')",
 ]

@@ -216,7 +216,7 @@ edge0-35b, 2.8 for edge0-8b** (MMLU-Pro is even above the base). Max 100:
 
 ## Benchmark
 
-Measured with `examples/bench.py` (3.3k-token prompt prefill → 10 sampled
+Measured with `examples/bench.py` (3.3k-token prompt prefill → 10 greedy
 warmup steps → 200 timed sampled decode tokens, 2 runs per tier):
 
 | Tier | Decode speed | Prefill throughput (cold / warm)* | Peak active memory** | Test machine |

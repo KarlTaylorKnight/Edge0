@@ -198,7 +198,7 @@ engine.close()   # 释放 mmap / 专家缓存
 
 ## 性能实测
 
-`examples/bench.py` 实测（3.3k token prompt prefill → 10 步采样 warmup →
+`examples/bench.py` 实测（3.3k token prompt prefill → 10 步贪心 warmup →
 200 token 计时段，每档 2 轮）：
 
 | 档位 | 解码速度 | Prefill 吞吐（冷/热）* | 峰值 active 内存** | 测试机器 |
