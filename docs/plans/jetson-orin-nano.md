@@ -224,6 +224,50 @@ Define slot ownership from free → filling → ready → in-use → reusable, w
 
 Test state transitions with fake events, then real CUDA stress/parity cases: wrong/late predictions, eviction during consumption, repeated requests and shutdown. Define counters and scopes for cache/prediction hits, bytes requested/read/copied, I/O wait and consumer stalls. Distinguish logical file reads from physical NVMe traffic. Demonstrate overlap and end-to-end improvement on the baseline workload before making the path default.
 
+**Status (15 September 2026, measured on the device):** the measured
+profile reshaped this task.  First finding: the tested 64-slot shared
+LRU is smaller than this tier's per-step working set (23 MoE layers x
+K=8 = 184 bundles), so on the baseline it NEVER hits (`hits: 0`,
+~184 rebuilds per token).  Second finding: fixing that (512 slots, 65%
+hit rate, loads 11,776 → 4,075 over the workload) moved end-to-end
+decode by roughly nothing (0.49–0.57 vs 0.50–0.52 tok/s) — the
+unoptimized decode is COMPUTE-bound (GPU pegged at 99%; per-call
+dequantization).  Per this task's own gate, the pinned-buffer /
+CUDA-stream slot pipeline (free→filling→ready→in-use→reusable,
+generation IDs) is therefore **deferred** — it would optimize a cost
+that is currently invisible end-to-end — and is to be revisited after
+Task 6 shrinks compute, when transfers become a meaningful fraction.
+
+What WAS implemented (opt-in, exact path untouched):
+`EDGE0_CACHE_SLOTS=<int>` overrides the REQUESTED LRU size (the budget
+may still lower it; zero/negative rejected), and
+`LayerOptions.predict_prefetch` / `EDGE0_PREDICT_PREFETCH=1` routes
+each step's prerouter predictions into the existing bounded
+`prefetch()` for non-staged layers (`prod_k8` keeps staged decode OFF;
+`stage_experts` is untouched; wrong/late predictions fall back to
+demand loads through `_get_bundles` — never a staged zero row).  The
+prefetch buffer is raised to one full predicted step (owners x K = 128)
+and the per-layer in-flight bound defaults to K, both priced by the
+Task 4 budget (in-flight transient = per-layer bound x producing
+layers).  Reuse-safety of consumed bundles rests on Python/torch
+reference counting (consumers hold the tensors they use); the manual
+slot-generation lifecycle belongs to the deferred pinned design.
+
+Measured (3 independent launches x 2 runs, identical workload and
+instrumentation as the Task 3 baseline, budget active): decode
+**0.568–0.623 tok/s, mean 0.594** vs baseline 0.53–0.58 mean 0.552
+(**+7.7%**); hit rate 85% (10,059 hits / 1,717 loads); 2,038 of 2,063
+predicted prefetches consumed (98.8%), 0 wasted, prefetch_wait 0.0 s —
+the builds genuinely overlap the forward; load wall 26.5 s → ~6 s;
+CUDA peak 1.45/1.58 GiB and RSS 5.48–5.82 GiB, both inside the
+resolved budget (headroom ≈ 1.27 GB) with no OOM.  Token choices are
+bit-identical to the Task 3 reference sequence with both knobs on.
+Kept **off by default** per Gate D: the gain is real but small while
+compute dominates; defaulting is a profile change to make together
+with the Task 6 re-measurement.  Remaining for a later increment:
+logical-vs-physical NVMe read accounting, CUDA stress cases for
+eviction-during-consumption, and the deferred pinned-slot pipeline.
+
 ## Task 6 — conditional quantized-kernel work [C14]
 
 Use the measured profile to choose expert gather, dense quantized linear work, or no kernel change. For an INT4 prototype, verify the actual checkpoint layout: packed words, group size, signed/negative scale behavior, bias handling, accumulation and output dtype. Pin the CUDA extension/CUTLASS/compiler combination supported by the detected Orin stack and verify runtime loading.

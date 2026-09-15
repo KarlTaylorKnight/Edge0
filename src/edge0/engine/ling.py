@@ -35,6 +35,47 @@ from edge0.streaming.install import install_streaming_experts
 from edge0.streaming.mmap import SafetensorsMmap
 
 
+def _apply_env_profile(cfg, opts, spec):
+    """Task 5 opt-in profile knobs, applied to the REQUESTED options
+    before the budget prices them (the budget may still lower them).
+
+    ``EDGE0_CACHE_SLOTS=<int>``: request a different shared-LRU size.
+    The tested default (64) is smaller than the per-step working set on
+    this tier (23 MoE layers x K=8 = 184 bundles), so it never hits;
+    512 measured a 65% hit rate on the Orin baseline (evidence in the
+    plan's Task 5 status).
+
+    ``EDGE0_PREDICT_PREFETCH=1``: enable
+    ``LayerOptions.predict_prefetch``; the prefetch buffer is raised to
+    hold one full predicted step (owners x K) and the per-layer
+    in-flight bound defaults to K, both priced by the budget.
+    """
+    from dataclasses import replace as _dc_replace
+    env_slots = os.environ.get("EDGE0_CACHE_SLOTS", "").strip()
+    if env_slots:
+        try:
+            slots = int(env_slots)
+        except ValueError:
+            raise ValueError(
+                f"EDGE0_CACHE_SLOTS must be an integer, got "
+                f"{env_slots!r}") from None
+        if slots <= 0:
+            raise ValueError(
+                f"EDGE0_CACHE_SLOTS must be positive, got {slots} "
+                "(0 would disable eviction, not caching)")
+        opts = _dc_replace(opts, cache_slots=slots)
+    if os.environ.get("EDGE0_PREDICT_PREFETCH", "") == "1":
+        opts = _dc_replace(opts, predict_prefetch=True)
+    if opts.predict_prefetch:
+        owners_n = len(getattr(cfg.prerouter, "owners", ()) or ())
+        per_layer = opts.top_k or spec.top_k
+        opts = _dc_replace(
+            opts,
+            prefetch_cap=max(opts.prefetch_cap, owners_n * per_layer),
+            max_inflight=opts.max_inflight or per_layer)
+    return opts
+
+
 def _resolve_memory_budget(cfg, opts, shards):
     """Resolve the Task 4 memory budget when ``EDGE0_MEMORY_BUDGET`` asks
     for one; return ``None`` when it is off (the default — behavior is
@@ -83,6 +124,16 @@ def _resolve_memory_budget(cfg, opts, shards):
             "tier; a memory budget cannot price the declared context")
     context = int(os.environ.get("EDGE0_BUDGET_CONTEXT", "1024"))
     top_k = opts.top_k or spec.top_k
+    # In-flight transient: per-layer bound x layers that can be
+    # producing at once.  With predict_prefetch every owner layer may
+    # hold a step's predictions in flight; otherwise only the thread
+    # pool's builds are outstanding.
+    per_layer_inflight = opts.max_inflight or max(1, opts.prefetch_threads)
+    if opts.predict_prefetch:
+        producing_layers = len(getattr(cfg.prerouter, "owners", ()) or ())
+        inflight_total = max(1, per_layer_inflight * producing_layers)
+    else:
+        inflight_total = per_layer_inflight
     # The dequantized dense-weight cache measured 4.1 GB extra resident
     # for this tier on the GB10 (backends/cuda/nn.py); the budget only
     # ever vetoes it, never enables it.
@@ -98,7 +149,7 @@ def _resolve_memory_budget(cfg, opts, shards):
         requested_cache_slots=opts.cache_slots,
         requested_prefetch_cap=opts.prefetch_cap,
         full_layer_prefill=opts.full_layer_prefill,
-        inflight_builds=max(1, opts.prefetch_threads),
+        inflight_builds=inflight_total,
         min_cache_slots=2 * top_k,
         weight_cache_bytes=4_100_000_000 if weight_cache_requested
         else None,
@@ -144,14 +195,19 @@ def load_installed(model_dir: str, cfg):
     spec = cfg.moe_spec
     opts = cfg.options
     n_layers = model_config["num_hidden_layers"]
+    opts = _apply_env_profile(cfg, opts, spec)
     resolved_budget = _resolve_memory_budget(cfg, opts, shards)
     shared_cache = prefetch_buffer = None
     if resolved_budget is not None:
         from dataclasses import replace as _dc_replace
+        # cache/prefetch capacities come from the budget; the in-flight
+        # bound stays PER-LAYER (the budget priced the total across
+        # producing layers, see _resolve_memory_budget).
         opts = _dc_replace(
             opts, cache_slots=resolved_budget.cache_slots,
             prefetch_cap=resolved_budget.prefetch_cap,
-            max_inflight=resolved_budget.max_inflight)
+            max_inflight=(opts.max_inflight
+                          or max(1, opts.prefetch_threads)))
         shared_cache = SharedExpertCache(resolved_budget.cache_slots)
         prefetch_buffer = PrefetchBuffer(
             resolved_budget.prefetch_cap,
@@ -177,10 +233,15 @@ def load_installed(model_dir: str, cfg):
     if cfg.prerouter and cfg.prerouter.weights_file:
         pg_state, heads = install_prerouter(
             model=model, spec=spec, pspec=cfg.prerouter, n_layers=n_layers)
+        prefetch_layers = None
+        if opts.predict_prefetch:
+            prefetch_layers = {li: t for li, t in all_stream.items()
+                               if not t._staged_mode}
         pg_stager = LingPrerouterStager(
             model=model, spec=spec, pspec=cfg.prerouter,
             state=pg_state, stream_layers=stream_layers,
-            top_k=cfg.prerouter_top_k)
+            top_k=cfg.prerouter_top_k,
+            prefetch_layers=prefetch_layers)
         print(f"[edge0-8b] prerouter installed: {len(heads)} heads, "
               f"start={cfg.prerouter.start_layer}, "
               f"K={cfg.prerouter_top_k}", flush=True)

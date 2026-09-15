@@ -122,6 +122,27 @@ identically to the unbudgeted baseline; a declared 4096-token context
 is rejected (KV alone ≈ 4.5 GB), as is the weight cache.  Unset, the
 engine behaves exactly as before Task 4.
 
+### Bounded expert reuse and predicted prefetch (Task 5, opt-in)
+
+The measured Orin profile found the tested 64-slot LRU never hits on
+this tier (working set 184 bundles/step) — and also that decode is
+compute-bound, so transfers barely show end-to-end until the Task 6
+kernel work lands.  Two opt-in knobs, both scheduling-only (token
+output is bit-identical; wrong or late predictions fall back to demand
+loads, never a staged zero row):
+
+* `EDGE0_CACHE_SLOTS=512` — request a working-set-sized shared LRU
+  (the budget may lower it).  85% hit rate on the baseline workload.
+* `EDGE0_PREDICT_PREFETCH=1` — the prerouter's per-step predictions
+  are prefetched for non-staged layers while the current forward runs
+  (98.8% of predicted builds consumed, zero waited on, zero wasted).
+
+Together on the baseline workload: decode 0.568–0.623 tok/s (mean
+0.594) vs 0.53–0.58 (mean 0.552) — **+7.7%**, for ~0.6 GiB more
+resident, inside the resolved budget.  Off by default until the
+post-Task-6 re-measurement; the pinned-buffer CUDA-stream pipeline is
+deferred on the same evidence (see the plan's Task 5 status).
+
 ## Benchmark reporting
 
 `examples/bench.py` keeps its two-run protocol and its human-readable output

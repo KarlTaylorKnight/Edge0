@@ -46,6 +46,16 @@ class LayerOptions:
             builds (None = unbounded, the historical behavior).  Demand
             loads are never dropped; a memory budget sets this so the
             producer queue cannot outrun the priced-in transient.
+        predict_prefetch: route each step's prerouter predictions into
+            ``prefetch()`` for NON-staged layers (the prod profiles),
+            overlapping next-step expert builds with the current
+            forward.  Scheduling only: consumption stays on the exact
+            ``_get_bundles`` path (late/wrong predictions fall back to
+            demand loads; no staged zero rows).  Default off — on the
+            Orin the unoptimized decode is compute-bound and the
+            measured end-to-end benefit was below noise (see
+            docs/plans/jetson-orin-nano.md Task 5); revisit once the
+            Task 6 kernel work shrinks compute.
         load_threads: threads for on-demand expert builds.
         prefetch_threads: threads for eager prefetch builds.
         use_compile: wrap the MoE math in ``mx.compile``.
@@ -74,6 +84,7 @@ class LayerOptions:
     cache_slots: int = 64
     prefetch_cap: int = 48
     max_inflight: int | None = None
+    predict_prefetch: bool = False
     load_threads: int = 8
     prefetch_threads: int = 4
     use_compile: bool = True
