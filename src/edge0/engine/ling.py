@@ -76,6 +76,16 @@ def _apply_env_profile(cfg, opts, spec):
     return opts
 
 
+def _torch_quant_modules():
+    """``(nn, quant)`` of the torch backend, ``(None, None)`` on MLX."""
+    from edge0.backends import backend
+    if backend.name != "cuda":
+        return None, None
+    from edge0.backends.cuda import nn as cnn
+    from edge0.backends.cuda import quant as cq
+    return cnn, cq
+
+
 def _resolve_memory_budget(cfg, opts, shards):
     """Resolve the Task 4 memory budget when ``EDGE0_MEMORY_BUDGET`` asks
     for one; return ``None`` when it is off (the default — behavior is
@@ -134,11 +144,24 @@ def _resolve_memory_budget(cfg, opts, shards):
         inflight_total = max(1, per_layer_inflight * producing_layers)
     else:
         inflight_total = per_layer_inflight
-    # The dequantized dense-weight cache measured 4.1 GB extra resident
-    # for this tier on the GB10 (backends/cuda/nn.py); the budget only
-    # ever vetoes it, never enables it.
+    # The dense dequantized-weight cache: the full cache (measured 4.1 GB
+    # in float32 on the GB10; the loader now prices the actual bf16 total
+    # of this tier's QuantizedLinear modules) is only ever vetoed by the
+    # budget, never enabled; the capped cache (Task 6) is shrunk to the
+    # headroom.  The batched expert gather's per-call transient cap is
+    # deducted once when that path is on.
     weight_cache_requested = (
         os.environ.get("EDGE0_TORCH_WEIGHT_CACHE", "") == "1")
+    cnn, cq = _torch_quant_modules()
+    candidate_total = cnn.WEIGHT_CACHE.candidate_bytes_total() if cnn else 0
+    request = _budget.dense_cache_request(
+        full_requested=weight_cache_requested,
+        cap_bytes=cnn.WEIGHT_CACHE.cap_bytes if cnn else None,
+        candidate_total=candidate_total,
+        max_fill_transient_bytes=(
+            cnn.WEIGHT_CACHE.max_fill_transient_bytes(admitted_only=False)
+            if cnn else 0))
+    kernel_transient = int(cq.BATCHED_MAX_BYTES) if (cq and cq.BATCHED) else 0
     resolved = _budget.resolve_budget(
         obs,
         _budget.ExpertFootprint(
@@ -151,15 +174,31 @@ def _resolve_memory_budget(cfg, opts, shards):
         full_layer_prefill=opts.full_layer_prefill,
         inflight_builds=inflight_total,
         min_cache_slots=2 * top_k,
-        weight_cache_bytes=4_100_000_000 if weight_cache_requested
-        else None,
+        weight_cache_bytes=(request["priced_bytes"]
+                            if request["mode"] != "off" else None),
+        reserves=_budget.Reserves(kernel_transient_bytes=kernel_transient),
         )
-    if weight_cache_requested and not resolved.weight_cache_permitted:
+    if request["mode"] == "full" and not resolved.weight_cache_permitted:
         raise _budget.BudgetError(
             "EDGE0_TORCH_WEIGHT_CACHE=1 rejected: the dequantized dense "
-            f"weights (~4.1 GB) do not fit the resolved headroom of "
-            f"{resolved.headroom_bytes:,} bytes "
+            f"weights ({request['resident_bytes']:,} bytes resident plus a "
+            f"{request['fill_transient_bytes']:,} byte build transient) do "
+            f"not fit the resolved headroom of {resolved.headroom_bytes:,} "
+            f"bytes "
             f"(budget: {resolved.as_dict()})")
+    if request["mode"] == "capped" and cnn is not None:
+        from dataclasses import replace as _dc_replace
+        # The policy admits each module with its own build transient, so
+        # the effective cap is the headroom itself.
+        effective = _budget.effective_capped_bytes(
+            cap_bytes=request["cap_bytes"],
+            headroom_bytes=resolved.headroom_bytes)
+        summary = cnn.WEIGHT_CACHE.finalize(effective)
+        resolved = _dc_replace(resolved, notes=resolved.notes + (
+            f"capped weight cache: requested {request['cap_bytes']:,} B, "
+            f"effective {effective:,} B, admitted "
+            f"{summary['admitted_bytes']:,} B in "
+            f"{len(summary['admitted'])} modules",))
     return resolved
 
 

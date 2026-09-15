@@ -19,8 +19,10 @@ Accounting rules (Gate C):
   load-drop materializes every expert of one layer at once when
   ``full_layer_prefill`` is on); in-flight expert builds (bounded by
   the resolved ``max_inflight``, not the thread count alone); pinned
-  staging (Task 5 — zero today); and an allocator/driver allowance
-  (fraction of the observed total, applied once).
+  staging (Task 5 — zero today); the batched expert gather's per-call
+  transient cap (Task 6 — zero unless ``EDGE0_QMM_BATCHED=1``); and an
+  allocator/driver allowance (fraction of the observed total, applied
+  once).
 * What remains is the retained-cache allowance, split between the
   shared LRU and the prefetch buffer in payload bytes computed from
   checkpoint metadata — slot counts alone are meaningless.
@@ -38,7 +40,7 @@ Accounting rules (Gate C):
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 class BudgetError(ValueError):
@@ -110,6 +112,9 @@ class Reserves:
     allocator_fraction: float = 0.10
     #: Task 5's pinned staging pool; zero until it exists.
     pinned_staging_bytes: int = 0
+    #: Task 6's batched expert gather: the per-call transient cap
+    #: (``EDGE0_QMM_BATCHED_MAX_BYTES``) when that path is on, else zero.
+    kernel_transient_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -154,6 +159,44 @@ class ResolvedBudget:
             "headroom_bytes": self.headroom_bytes,
             "notes": list(self.notes),
         }
+
+
+def dense_cache_request(*, full_requested: bool, cap_bytes,
+                        candidate_total: int,
+                        max_fill_transient_bytes: int = 0) -> dict:
+    """What the budget prices for the dense dequantized-weight cache
+    (Task 6).
+
+    The price is the RESIDENT bytes the cache keeps plus the largest
+    single build transient: the weights are filled lazily at the first
+    forward, one chunked module at a time, so exactly one transient is
+    live but it must still fit alongside everything resident.
+
+    ``full`` (``EDGE0_TORCH_WEIGHT_CACHE=1``) prices the loader's measured
+    total of every ``QuantizedLinear`` (the GB10's 4.1 GB figure only when
+    no model is loaded yet) and keeps its veto; ``capped``
+    (``EDGE0_TORCH_WEIGHT_CACHE_BYTES``) prices ``min(cap, total)`` and is
+    later shrunk to the headroom instead of vetoed; ``off`` prices nothing.
+    """
+    fill = _non_negative_int("max_fill_transient_bytes",
+                             max_fill_transient_bytes)
+    if full_requested:
+        resident = candidate_total or 4_100_000_000
+        return {"mode": "full", "priced_bytes": resident + fill,
+                "resident_bytes": resident, "fill_transient_bytes": fill,
+                "cap_bytes": None}
+    if cap_bytes:
+        resident = min(int(cap_bytes), candidate_total)
+        return {"mode": "capped", "priced_bytes": resident + fill,
+                "resident_bytes": resident, "fill_transient_bytes": fill,
+                "cap_bytes": int(cap_bytes)}
+    return {"mode": "off", "priced_bytes": 0, "resident_bytes": 0,
+            "fill_transient_bytes": 0, "cap_bytes": None}
+
+
+def effective_capped_bytes(*, cap_bytes: int, headroom_bytes: int) -> int:
+    """The capped cache never exceeds the budget's post-cache headroom."""
+    return max(0, min(int(cap_bytes), int(headroom_bytes)))
 
 
 def bundle_bytes_from_entries(entries: dict, key_prefix: str,
@@ -238,6 +281,8 @@ def resolve_budget(
         ("inflight_expert_builds", inflight_bytes),
         ("pinned_staging", _non_negative_int(
             "pinned_staging_bytes", reserves.pinned_staging_bytes)),
+        ("kernel_transient", _non_negative_int(
+            "kernel_transient_bytes", reserves.kernel_transient_bytes)),
     )
     allowance = usable - sum(d[1] for d in deductions)
     if allowance <= 0:

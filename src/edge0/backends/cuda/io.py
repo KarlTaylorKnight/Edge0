@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 from edge0.backends.base import TensorStore
-from edge0.backends.cuda.core import DEVICE, _as_tensor
+from edge0.backends.cuda.core import DEVICE
 
 _DTYPES = {
     "F64": torch.float64, "F32": torch.float32, "F16": torch.float16,
@@ -338,6 +338,7 @@ def _install_quantized(model, state: dict, dtype) -> set:
         if isinstance(mod, torch.nn.Linear):
             bias = state.pop(f"{path}.bias", None)
             new = cnn.QuantizedLinear(w, s, b, mod.in_features, bias=bias)
+            cnn.WEIGHT_CACHE.register(path, new)   # capped exact cache candidate
         elif isinstance(mod, torch.nn.Embedding):
             new = cnn.QuantizedEmbedding(w, s, b, mod.embedding_dim,
                                          dtype=dtype)
@@ -379,8 +380,6 @@ def load_model(model_path, lazy=True, strict=False, model_config=None,
     import json
     import os
 
-    import torch
-
     with open(os.path.join(os.fspath(model_path), "config.json")) as f:
         raw_config = json.load(f)
 
@@ -417,7 +416,12 @@ def load_model(model_path, lazy=True, strict=False, model_config=None,
         _undo_mlx_qwen35_sanitize(state)
     if engine_path and hasattr(model, "sanitize"):
         state = model.sanitize(state)
+    from edge0.backends.cuda import nn as _cnn
+    _cnn.WEIGHT_CACHE.begin()                 # one model per process
     quantized = _install_quantized(model, state, dtype)
+    # Admit against the requested cap now; the 8B engine re-finalizes
+    # against the memory budget's headroom once that is resolved.
+    _cnn.WEIGHT_CACHE.finalize()
     for k, t in state.items():
         if dtype is not None and t.is_floating_point():
             state[k] = t.to(dtype)

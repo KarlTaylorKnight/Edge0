@@ -98,6 +98,8 @@ ENV_KNOBS = ("BENCH_TEMP", "BENCH_PROMPT", "BENCH_SEED", "BENCH_NTOK",
              "BENCH_LONG", "EDGE0_BACKEND", "EDGE0_TORCH_DEVICE",
              "EDGE0_MEMORY_BUDGET", "EDGE0_BUDGET_CONTEXT",
              "EDGE0_CACHE_SLOTS", "EDGE0_PREDICT_PREFETCH",
+             "EDGE0_QMM_BATCHED", "EDGE0_QMM_BATCHED_MAX_BYTES",
+             "EDGE0_TORCH_WEIGHT_CACHE_BYTES", "EDGE0_INT4PACK",
              "EDGE0_TORCH_WEIGHT_CACHE", "EDGE0_PREWARM", "LING_PREWARM",
              "MLX_CACHE_LIMIT_MB", "LING_HIDDEN_CLIP",
              "PREROUTER_FEATURE_TOPK", "PREROUTER_INTRA")
@@ -438,6 +440,54 @@ def _runtime_group(bench: dict, backend) -> dict:
     }
 
 
+def _quant_paths_group(engine) -> dict:
+    """Resolved state of the torch backend's opt-in quantized paths
+    (Task 6): the batched expert gather, the capped exact weight cache
+    and the int4 kernel, with the bytes each one added."""
+    from edge0.backends.cuda import int4pack as i4
+    from edge0.backends.cuda import nn as cuda_nn
+    from edge0.backends.cuda import quant as cq
+    repacked = 0
+    extra = 0
+    filled = 0
+    filled_bytes = 0
+    reasons: dict[str, str] = {}
+    model = getattr(engine, "model", None)
+    if model is None or not hasattr(model, "modules"):
+        reasons["repacked_modules"] = "engine exposes no torch model"
+        reasons["extra_bytes"] = "engine exposes no torch model"
+        repacked = extra = None
+        filled = filled_bytes = None
+    else:
+        for module in model.modules():
+            n = getattr(module, "int4pack_bytes", None)
+            if callable(n):
+                b = n()
+                if b:
+                    repacked += 1
+                    extra += b
+            if getattr(module, "_dequantized", None) is not None:
+                filled += 1
+                filled_bytes += cuda_nn.dequantized_bytes(module)
+    policy = dict(cuda_nn.WEIGHT_CACHE.summary())
+    # Admission is deliberately conservative: a module is admitted on the
+    # assumption it will be used at the priced dtype, but the cache only
+    # fills when the activation itemsize matches.  Report what is actually
+    # resident next to what was reserved, so the two are never confused.
+    policy["filled_modules"] = filled
+    policy["filled_bytes"] = filled_bytes
+    policy = _with_reasons(policy, "weight cache policy off or not finalized")
+    return {
+        "batched_gather": {"enabled": bool(cq.BATCHED),
+                           "max_transient_bytes": int(cq.BATCHED_MAX_BYTES)},
+        "weight_cache_policy": policy,
+        "int4pack": {"enabled": bool(i4.INT4PACK),
+                     "repacked_modules": repacked,
+                     "extra_bytes": extra,
+                     "unavailable_reasons": reasons},
+    }
+
+
 def _caches_group(engine, backend) -> dict:
     opts = getattr(engine.cfg, "options", None)
     reasons: dict[str, str] = {}
@@ -473,9 +523,11 @@ def _caches_group(engine, backend) -> dict:
     thread_reasons = {}
     weight_cache = None
     mlx_cache_limit = None
+    quant_paths = None
     if backend.name == "cuda":
         from edge0.backends.cuda import nn as cuda_nn
         weight_cache = bool(getattr(cuda_nn, "CACHE_DEQUANTIZED", False))
+        quant_paths = _quant_paths_group(engine)
         try:
             import torch
             threads["torch_num_threads"] = int(torch.get_num_threads())
@@ -485,6 +537,8 @@ def _caches_group(engine, backend) -> dict:
     else:
         reasons["weight_cache"] = (
             "EDGE0_TORCH_WEIGHT_CACHE applies to the torch backend only")
+        reasons["quant_paths"] = (
+            "the opt-in quantized paths exist in the torch backend only")
         thread_reasons["torch_num_threads"] = "backend is not torch"
         try:
             mlx_cache_limit = int(
@@ -514,6 +568,7 @@ def _caches_group(engine, backend) -> dict:
         "memory_budget": (resolved_budget.as_dict()
                           if resolved_budget is not None else None),
         "weight_cache": weight_cache,
+        "quant_paths": quant_paths,
         "prewarm": prewarm,
         "threads": threads,
         "mlx_cache_limit_bytes": mlx_cache_limit,

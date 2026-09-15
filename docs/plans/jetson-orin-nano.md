@@ -277,6 +277,33 @@ qualify. Development is handed to a workstation GPU per
 [`rtx6000-task6-handoff.md`](rtx6000-task6-handoff.md); decisions and
 acceptance stay on the Orin.
 
+**Workstation increment (15 September 2026, RTX PRO 6000, torch
+2.14.0+cu130 — parity and pricing only, no Orin decision):** three
+opt-in, guarded paths, documented in `docs/nvidia.md` ("Opt-in quantized
+paths"): `EDGE0_QMM_BATCHED=1` (exact batched expert gather, transient
+priced at 140 MB for the decode shape and deducted by the budget),
+`EDGE0_TORCH_WEIGHT_CACHE_BYTES=<n>` (exact capped dequantized-weight
+cache, first-fit, shrunk to the budget headroom; the full cache is now
+priced at the measured bf16 total, 1.40 GB for this tier, not 4.1 GB),
+and `EDGE0_INT4PACK=1` (torch's built-in int4 kernel: approximate at
+bf16 rounding, bounds registered in `tests/test_int4pack.py` before any
+Orin run). Design C (custom fused kernel) was scoped to a cross-compile
+toolchain record only. Orin acceptance for each knob: the Task 3
+reference check with `--test-env <knob>` against the reference path on
+the same device, then the three-launch benchmark protocol.
+
+**Finding that reshapes this task's dense half:** traced on the real
+model, 400 of 470 dense `QuantizedLinear` calls per step arrive with
+float32 activations and only 70 with bfloat16. Both dense knobs require
+bf16, so the weight cache fills 35 of the 235 modules it admits
+(0.174 GB of 1.402 GB reserved) and the int4 kernel repacks exactly
+those same 35. Neither moves decode measurably as a result. The dense
+26% is therefore gated by activation dtype, not by the kernel; whether
+those call sites can run bf16, and what that costs numerically, is the
+question to settle on the device before more kernel effort. The batched
+expert gather is unaffected: it covers the routed 37% and engages on
+every call.
+
 Use the measured profile to choose expert gather, dense quantized linear work, or no kernel change. For an INT4 prototype, verify the actual checkpoint layout: packed words, group size, signed/negative scale behavior, bias handling, accumulation and output dtype. Pin the CUDA extension/CUTLASS/compiler combination supported by the detected Orin stack and verify runtime loading.
 
 Dispatch only supported dtype/shape/stride/transpose/group-size/device combinations to the new kernel. Keep the current implementation for unsupported cases, including 2/8-bit layouts. Test all existing broadcast and gather shapes, valid index boundaries, quantization extremes and checkpoint dtypes. Compare numerical results against both deterministic MLX fixtures and the current Torch path on Orin. Define tolerances in advance and measure scratch-memory peaks as well as speed.

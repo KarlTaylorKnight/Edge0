@@ -143,6 +143,61 @@ resident, inside the resolved budget.  Off by default until the
 post-Task-6 re-measurement; the pinned-buffer CUDA-stream pipeline is
 deferred on the same evidence (see the plan's Task 5 status).
 
+### Opt-in quantized paths (Task 6, developed on a workstation GPU)
+
+The Orin profile (plan Task 6 scoping) put 37% of a decode step in
+`quant.gather_qmm` and 26% in the dense `QuantizedLinear.forward`, both
+dequantize-then-matmul.  Three opt-in paths were developed and parity-tested
+on an RTX PRO 6000 (torch 2.14.0+cu130, the Orin's torch version) per
+[`plans/rtx6000-task6-handoff.md`](plans/rtx6000-task6-handoff.md).  All are
+**off by default**, guarded (every unsupported case falls through to the
+reference implementation unchanged), priced for the Task 4 budget and
+recorded in the bench report's `caches.quant_paths` group.  Which one the
+Orin adopts, and any tok/s, is decided on the Orin.
+
+| Knob | What it does | Exact? | Extra memory |
+|---|---|---|---|
+| `EDGE0_QMM_BATCHED=1` | `gather_qmm` dequantizes the distinct experts of a call ONCE and runs ONE batched matmul over a padded per-expert slab instead of a Python loop of dequantize+matmul pairs (decode: 8 pairs -> 1 + 1). Affine 4-bit only; 2/8-bit and any call whose priced transient exceeds `EDGE0_QMM_BATCHED_MAX_BYTES` (default 256 MiB) take the reference loop. | yes: same float32 arithmetic, parity 1e-4 to a float64 hand reference and 1e-5 to the loop | per-call transient only, priced by `quant.batched_transient_bytes`; the cap is deducted once by the budget |
+| `EDGE0_TORCH_WEIGHT_CACHE_BYTES=<n>` | keeps the dequantized bf16 weight of the dense `QuantizedLinear` modules that fit `n` bytes, admitted first-fit in checkpoint order with each module's own build transient counted (`nn.WeightCachePolicy`); the engine shrinks `n` to the budget's post-cache headroom; the admitted module list is in the report | the dequantized weight is bit-identical to the on-the-fly path (same per-chunk expression, asserted on CUDA); the cached forward then issues one GEMM where the reference issues one per 4096-row chunk, so for the two modules wider than a chunk (lm_head, layer-0 dense gate/up) cuBLAS may split differently — identical on this GPU and on the CPU, and the reference check decides on the device | the admitted bytes plus one build transient at a time: the fill is chunked, so it costs `nn.fill_transient_bytes` (edge0-8b's widest module, lm_head 157184 x 1536: 460.5 MiB resident, 556.9 MiB measured peak) rather than the 3702 MiB a whole-weight dequantization peaks at. edge0-8b's cacheable dense linears total 1.40 GB in bf16: lm_head 0.46 GiB, attention and shared experts the rest. Routers are not quantized in this checkpoint and `word_embeddings` is a `QuantizedEmbedding` that dequantizes only the rows it looks up, so neither is a candidate |
+| `EDGE0_INT4PACK=1` | dense `QuantizedLinear` through torch's built-in `_weight_int4pack_mm` after a one-time repack of the MLX layout (uint32 LSB-first codes -> uint8 high-nibble-first pairs, `zero = bias + 8 * scale`), lazily on the first eligible call; CUDA + bf16 activations + 4-bit + group 32/64/128/256 + `in_features % 128 == 0` + `out_features % 8 == 0` only, and `int4pack.probe` must execute the kernel once on the device first (the Orin's wheel warns `sm_87` is outside its SASS list, so execution evidence gates, not the warning); a runtime failure disables the path for that module permanently | **no**: `zero` is rounded to bf16 and the kernel dequantizes in bf16; measured (identity-vector probe, n=512, k=1536): per-weight error median 3.7e-4, p99 3.7e-3, max 1.1e-2; 68% of weights equal the reference's bf16-rounded weights, the rest within ~1-2 bf16 ulps; outputs within 3.5e-3 of the output scale. Pre-registered test bounds: 1e-2 of output scale, 2^-6 (max|w| + max|zero|) per weight | duplicates the int4 payload it covers (`int4pack_extra_bytes`) next to the original buffers; for all of edge0-8b's dense linears that is 0.35 GB |
+
+Precedence inside `QuantizedLinear.forward`: full cache, then the capped
+cache, then the int4 kernel, then the chunked on-the-fly dequantization —
+exact paths first.
+
+**Both dense knobs need bfloat16 activations, and most calls are not.**
+Traced on the real edge0-8b model over one prefill plus one decode step,
+400 of 470 dense `QuantizedLinear` calls arrive as float32 and only 70 as
+bfloat16. The cache therefore fills 35 of the 235 modules it admits
+(0.174 GB of the 1.402 GB reserved) and the int4 kernel repacks exactly
+those same 35. The reservation stays conservative on purpose — it never
+under-reserves — and the report states `filled_bytes` next to
+`admitted_bytes` so residency is never overstated. The routed path
+(`EDGE0_QMM_BATCHED`) has no such gate and engages on every call.  The batched gather touches only the routed-expert
+path; the dense knobs touch only the dense path; nothing changes token
+choice by construction except the int4 kernel, whose acceptability the
+32-token reference check decides (`scripts/orin_reference_check.py` now
+takes `--test-env KEY=VALUE` / `--reference-env` so the reference path and an
+opt-in path can be compared on the SAME device, isolating the path from
+device noise).
+
+Tests (no MLX, hand-computed references, tolerances written before any Orin
+run): `tests/test_quant_paths.py` (every broadcast shape of
+`tests/test_cuda_backend.py`, 2/8-bit fall-through, index boundaries,
+negative scales, code extremes, bf16 dtypes, transient cap fall-back, the
+allocator-measured transient against the price, kernel-launch counts),
+`tests/test_weight_cache_policy.py` (admission, caps, re-finalize, bit
+identity, loader registration), `tests/test_int4pack.py` (exact repack round
+trip, the zero mapping, every guard, the registered kernel bounds, the LoRA
+wrapper, exact-cache precedence), `tests/test_task6_budget.py` (pricing).
+The CUDA cases skip without a device and FAIL under `--require-cuda`.
+
+Custom fused kernel (design C): not written. Toolchain recorded for the next
+session: WSL Ubuntu nvcc 13.0.88 + g++ 13.3 compile
+`-gencode arch=compute_87,code=sm_87 -gencode arch=compute_120,code=sm_120`
+fat binaries that run on this GPU; Windows has VS 2022 BuildTools + CUDA
+12.8 as an alternative.
+
 ## Benchmark reporting
 
 `examples/bench.py` keeps its two-run protocol and its human-readable output

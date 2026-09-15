@@ -46,7 +46,8 @@ def test_roomy_budget_keeps_requested_profile():
     assert names == ["os_growth_reserve", "allocator_allowance",
                      "kv_cache_at_declared_context",
                      "full_layer_prefill_transient",
-                     "inflight_expert_builds", "pinned_staging"]
+                     "inflight_expert_builds", "pinned_staging",
+                     "kernel_transient"]
 
 
 def test_deductions_use_declared_values():
