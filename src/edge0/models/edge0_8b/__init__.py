@@ -69,6 +69,10 @@ class Ling8BConfig(ModelConfig):
             port=8083,
             target_tok_s=33.0,
             peak_active_mem_mb=1400.0,
+            # README benchmark: ~3.3 GiB of KV at 3.3k context on this
+            # tier (~1.05 MB/token, fp16 — dims, not backend, set this);
+            # rounded up for the budget arithmetic.
+            kv_bytes_per_token=1_100_000,
         )
 
 

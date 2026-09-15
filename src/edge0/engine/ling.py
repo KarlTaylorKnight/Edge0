@@ -29,8 +29,87 @@ from edge0.engine.hooks import (
 )
 from edge0.prerouter.install import install_prerouter
 from edge0.prerouter.stager import LingPrerouterStager
+from edge0.streaming import budget as _budget
+from edge0.streaming.cache import PrefetchBuffer, SharedExpertCache
 from edge0.streaming.install import install_streaming_experts
 from edge0.streaming.mmap import SafetensorsMmap
+
+
+def _resolve_memory_budget(cfg, opts, shards):
+    """Resolve the Task 4 memory budget when ``EDGE0_MEMORY_BUDGET`` asks
+    for one; return ``None`` when it is off (the default — behavior is
+    then exactly the pre-budget code path).
+
+    ``EDGE0_MEMORY_BUDGET`` accepts ``auto`` (observe MemAvailable and
+    any tighter address-space rlimit at this point, right before cache
+    construction) or an explicit byte count.  The declared context comes
+    from ``EDGE0_BUDGET_CONTEXT`` (tokens, default 1024): contexts
+    beyond the declaration are a different workload and must be
+    re-declared, not discovered as an OOM.
+    """
+    req = os.environ.get("EDGE0_MEMORY_BUDGET", "").strip()
+    if not req:
+        return None
+    if req == "auto":
+        import psutil
+        available = int(psutil.virtual_memory().available)
+        limit = None
+        try:
+            import resource
+            soft, _hard = resource.getrlimit(resource.RLIMIT_AS)
+            if soft not in (-1, resource.RLIM_INFINITY):
+                limit = int(soft)
+        except (ImportError, OSError, ValueError):
+            limit = None
+        obs = _budget.Observation(available_bytes=available,
+                                  process_limit_bytes=limit)
+    else:
+        try:
+            obs = _budget.Observation(available_bytes=int(req))
+        except ValueError:
+            raise _budget.BudgetError(
+                f"EDGE0_MEMORY_BUDGET must be 'auto' or a byte count, "
+                f"got {req!r}") from None
+    spec = cfg.moe_spec
+    # Layer 0 is dense on this tier; layer 1 carries the expert tensors.
+    entries = {}
+    for shard in shards:
+        entries.update(shard.entries)
+    bundle = _budget.bundle_bytes_from_entries(
+        entries, spec.key_template.format(layer=1), spec.num_experts)
+    if not cfg.kv_bytes_per_token:
+        raise _budget.BudgetError(
+            f"{cfg.name}: kv_bytes_per_token is not measured for this "
+            "tier; a memory budget cannot price the declared context")
+    context = int(os.environ.get("EDGE0_BUDGET_CONTEXT", "1024"))
+    top_k = opts.top_k or spec.top_k
+    # The dequantized dense-weight cache measured 4.1 GB extra resident
+    # for this tier on the GB10 (backends/cuda/nn.py); the budget only
+    # ever vetoes it, never enables it.
+    weight_cache_requested = (
+        os.environ.get("EDGE0_TORCH_WEIGHT_CACHE", "") == "1")
+    resolved = _budget.resolve_budget(
+        obs,
+        _budget.ExpertFootprint(
+            bundle_bytes=bundle, num_experts=spec.num_experts,
+            num_moe_layers=23),
+        _budget.WorkloadDecl(max_context_tokens=context,
+                             kv_bytes_per_token=cfg.kv_bytes_per_token),
+        requested_cache_slots=opts.cache_slots,
+        requested_prefetch_cap=opts.prefetch_cap,
+        full_layer_prefill=opts.full_layer_prefill,
+        inflight_builds=max(1, opts.prefetch_threads),
+        min_cache_slots=2 * top_k,
+        weight_cache_bytes=4_100_000_000 if weight_cache_requested
+        else None,
+        )
+    if weight_cache_requested and not resolved.weight_cache_permitted:
+        raise _budget.BudgetError(
+            "EDGE0_TORCH_WEIGHT_CACHE=1 rejected: the dequantized dense "
+            f"weights (~4.1 GB) do not fit the resolved headroom of "
+            f"{resolved.headroom_bytes:,} bytes "
+            f"(budget: {resolved.as_dict()})")
+    return resolved
 
 
 def _get_model_classes(config):
@@ -65,8 +144,28 @@ def load_installed(model_dir: str, cfg):
     spec = cfg.moe_spec
     opts = cfg.options
     n_layers = model_config["num_hidden_layers"]
+    resolved_budget = _resolve_memory_budget(cfg, opts, shards)
+    shared_cache = prefetch_buffer = None
+    if resolved_budget is not None:
+        from dataclasses import replace as _dc_replace
+        opts = _dc_replace(
+            opts, cache_slots=resolved_budget.cache_slots,
+            prefetch_cap=resolved_budget.prefetch_cap,
+            max_inflight=resolved_budget.max_inflight)
+        shared_cache = SharedExpertCache(resolved_budget.cache_slots)
+        prefetch_buffer = PrefetchBuffer(
+            resolved_budget.prefetch_cap,
+            max_cap=resolved_budget.max_prefetch_cap)
+        print(f"[edge0-8b] memory budget: usable="
+              f"{resolved_budget.usable_bytes:,}B cache_slots="
+              f"{resolved_budget.cache_slots} prefetch_cap="
+              f"{resolved_budget.prefetch_cap} headroom="
+              f"{resolved_budget.headroom_bytes:,}B"
+              + (f" notes={list(resolved_budget.notes)}"
+                 if resolved_budget.notes else ""), flush=True)
     installed = install_streaming_experts(
-        model, shards, spec, options=opts, num_layers=n_layers)
+        model, shards, spec, options=opts, num_layers=n_layers,
+        shared_cache=shared_cache, prefetch_buffer=prefetch_buffer)
     all_stream = {li: t for li, t in enumerate(installed) if t is not None}
     stream_layers = {li: t for li, t in all_stream.items() if t._staged_mode}
 
@@ -87,7 +186,8 @@ def load_installed(model_dir: str, cfg):
               f"K={cfg.prerouter_top_k}", flush=True)
     installs = dict(all_stream_layers=all_stream,
                     stream_layers=stream_layers,
-                    pg_state=pg_state, pg_stager=pg_stager)
+                    pg_state=pg_state, pg_stager=pg_stager,
+                    memory_budget=resolved_budget)
     return model, model_config, shards, installs
 
 
@@ -118,6 +218,9 @@ class Ling8BEngine(Edge0Engine):
         self._stream_layers = inst["stream_layers"]
         self._pg_state = inst["pg_state"]
         self._pg_stager = inst["pg_stager"]
+        #: Resolved Task 4 memory budget (None when EDGE0_MEMORY_BUDGET
+        #: is off); the bench report's caches group records it.
+        self.memory_budget = inst["memory_budget"]
         opts = cfg.options
         if self._tok is None:
             try:

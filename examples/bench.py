@@ -96,6 +96,7 @@ _PARA_EN = (
 #: default ``LING_HIDDEN_CLIP`` the user did not ask for).
 ENV_KNOBS = ("BENCH_TEMP", "BENCH_PROMPT", "BENCH_SEED", "BENCH_NTOK",
              "BENCH_LONG", "EDGE0_BACKEND", "EDGE0_TORCH_DEVICE",
+             "EDGE0_MEMORY_BUDGET", "EDGE0_BUDGET_CONTEXT",
              "EDGE0_TORCH_WEIGHT_CACHE", "EDGE0_PREWARM", "LING_PREWARM",
              "MLX_CACHE_LIMIT_MB", "LING_HIDDEN_CLIP",
              "PREROUTER_FEATURE_TOPK", "PREROUTER_INTRA")
@@ -500,10 +501,17 @@ def _caches_group(engine, backend) -> dict:
     except Exception as exc:  # noqa: BLE001 - diagnostics only
         stats = {"stats": None, "unavailable_reasons": {
             "stats": f"{type(exc).__name__}: {exc}"}}
+    resolved_budget = getattr(engine, "memory_budget", None)
+    if resolved_budget is None:
+        reasons["memory_budget"] = (
+            "no memory budget resolved (EDGE0_MEMORY_BUDGET off or "
+            "engine predates Task 4)")
     return {
         "layer_options": layer_options,
         "shared_cache_slots_resolved": shared_slots,
         "prefetch_cap_resolved": prefetch_cap,
+        "memory_budget": (resolved_budget.as_dict()
+                          if resolved_budget is not None else None),
         "weight_cache": weight_cache,
         "prewarm": prewarm,
         "threads": threads,

@@ -181,6 +181,39 @@ Resolve byte limits for completed caches and in-flight builds, prefetch buffers,
 
 Record resolved policy and rejected overrides. Keep full dequantized weight caching off unless the measured budget permits it. Test exhausted/tiny budgets, missing observations, overflow, invalid overrides, varying tensor sizes, inflight backpressure and repeated-request memory stability.
 
+**Status (15 September 2026, implemented and validated on the device):**
+`edge0/streaming/budget.py` (pure: `Observation` / `ExpertFootprint` /
+`WorkloadDecl` / `Reserves` → `resolve_budget()` → `ResolvedBudget` with
+itemized deductions; `bundle_bytes_from_entries()` prices the per-expert
+payload from the safetensors header, not slot counts).  Enforcement:
+`PrefetchBuffer` gained `max_cap` (a ceiling `set_cap` cannot exceed —
+bounds `prefetch_all()`'s silent growth to `num_experts + 32`);
+`LayerOptions.max_inflight` bounds QUEUED speculative prefetch builds
+(demand loads are never dropped); both default to the historical
+unbounded semantics when no budget is active.  Integration:
+`EDGE0_MEMORY_BUDGET=auto|<bytes>` resolved in the 8B engine's
+`load_installed` immediately before cache construction
+(`EDGE0_BUDGET_CONTEXT` declares the context, default 1024 tokens;
+`ModelConfig.kv_bytes_per_token` prices it — measured, 1.1 MB/token for
+this tier).  The resolved policy raises `BudgetError` pre-inference for
+impossible profiles — a calculated starved cache is rejected, never
+constructed as `SharedExpertCache(0)`/`PrefetchBuffer(0)` — and is
+recorded in the engine (`engine.memory_budget`) and the bench report's
+caches group.  `EDGE0_TORCH_WEIGHT_CACHE=1` under a budget is vetoed
+unless its measured 4.1 GB fits the post-cache headroom.  25 unit tests
+in `tests/test_memory_budget.py`; the streaming package init became
+lazy for backend-bound names so the pure modules test everywhere.
+On-device validation (Orin Nano 8 GB): `auto` resolved usable ≈ 4.2 GB,
+kept the tested 64/48 profile (real bundle ≈ 1.30 MiB/expert, full-layer
+transient 162 MiB), benchmark equivalent to the unoptimized baseline
+(0.52 tok/s, same peaks, RSS 5.55 GiB in the baseline range); a
+4096-token declaration was rejected with itemized arithmetic (KV
+4.5 GB > usable), and the weight cache was vetoed (4.1 GB > 2.2 GB
+headroom).  Not yet done: staged/assembled-copy pricing (the 8B
+`prod_k8` profile has staging off — budgeting a staged profile is
+future work with Task 5), and a long repeated-request soak (two
+same-process runs were stable; a sustained test belongs to Task 7).
+
 ## Task 5 — bounded asynchronous expert transfers [C12, C13]
 
 The 8B `prod_k8` profile deliberately disables staged decode. Do not enable `staged_k8` or replace routing to activate prefetch. Integrate the new transfer cache with the existing exact expert-consumption path. Predictions may change scheduling, not required expert identity or contribution. Missing required data must wait/load through the reference path rather than use the existing staged zero-row behavior.

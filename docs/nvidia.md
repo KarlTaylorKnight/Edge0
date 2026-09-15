@@ -94,6 +94,34 @@ Tasks 4–6 of the plan exist to remove (the GB10 measured 2.5× from the
 dequantized-weight cache alone; it is off here pending Task 4's byte
 budget).  Do not read 0.55 tok/s as the platform's capability.
 
+### Memory-budgeted profile (Task 4)
+
+`EDGE0_MEMORY_BUDGET=auto` (or an explicit byte count) makes the 8B
+engine resolve an explicit byte budget immediately before it builds the
+streaming caches: observed available RAM (tightened by any address-space
+rlimit), minus an OS-growth reserve, an allocator allowance, KV at the
+DECLARED context (`EDGE0_BUDGET_CONTEXT`, default 1024 tokens), the
+whole-layer prefill transient and in-flight expert builds — every
+payload priced from the checkpoint's safetensors header, not from slot
+counts.  What remains bounds the shared LRU and the prefetch buffer in
+bytes; the budget only ever LOWERS the tested profile, and it enforces
+two bounds the unbudgeted path leaves open (`PrefetchBuffer.max_cap`
+against `prefetch_all()`'s growth, `LayerOptions.max_inflight` against
+the speculative build queue).
+
+Impossible profiles fail BEFORE inference with the itemized arithmetic:
+a context whose KV cannot fit, a cache allowance below the working set
+(a calculated zero is rejected — `SharedExpertCache(0)` /
+`PrefetchBuffer(0)` mean *unbounded*, never "off"), or
+`EDGE0_TORCH_WEIGHT_CACHE=1` whose measured ~4.1 GB does not fit the
+post-cache headroom.  The resolved policy (or the rejection) lands in
+the bench report's `caches.memory_budget` group.  On the Orin Nano
+8 GB baseline workload, `auto` resolves ≈ 4.2 GB usable, keeps the
+tested 64-slot / 48-cap profile with ≈ 1.9 GB headroom, and measures
+identically to the unbudgeted baseline; a declared 4096-token context
+is rejected (KV alone ≈ 4.5 GB), as is the weight cache.  Unset, the
+engine behaves exactly as before Task 4.
+
 ## Benchmark reporting
 
 `examples/bench.py` keeps its two-run protocol and its human-readable output

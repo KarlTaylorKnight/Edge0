@@ -42,6 +42,10 @@ class LayerOptions:
             selecting hot pins.
         cache_slots: shared LRU capacity across all layers.
         prefetch_cap: prefetch buffer capacity.
+        max_inflight: per-layer bound on QUEUED speculative prefetch
+            builds (None = unbounded, the historical behavior).  Demand
+            loads are never dropped; a memory budget sets this so the
+            producer queue cannot outrun the priced-in transient.
         load_threads: threads for on-demand expert builds.
         prefetch_threads: threads for eager prefetch builds.
         use_compile: wrap the MoE math in ``mx.compile``.
@@ -69,6 +73,7 @@ class LayerOptions:
     pin_bonus: float = 2.0
     cache_slots: int = 64
     prefetch_cap: int = 48
+    max_inflight: int | None = None
     load_threads: int = 8
     prefetch_threads: int = 4
     use_compile: bool = True

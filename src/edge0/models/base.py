@@ -62,6 +62,11 @@ class ModelConfig:
     # acceptance profile (measured on the production Mac)
     target_tok_s: float = 0.0
     peak_active_mem_mb: float = 0.0
+    #: Measured KV-cache growth per context token (bytes), used by the
+    #: memory-budgeted profile (EDGE0_MEMORY_BUDGET) to price the
+    #: declared context.  0 = not measured for this tier; a requested
+    #: budget then fails loudly instead of guessing.
+    kv_bytes_per_token: int = 0
 
     @classmethod
     def from_pretrained(cls, model_dir: str | None = None, **overrides):

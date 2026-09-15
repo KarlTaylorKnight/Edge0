@@ -94,6 +94,7 @@ class StreamingSwitchGLU:
         self.hot_decay = o.hot_decay
         self._pin_bonus = o.pin_bonus
         self._use_compile = o.use_compile
+        self._max_inflight = o.max_inflight
 
         self._pool = ThreadPoolExecutor(max_workers=o.load_threads)
         self._prefetch_pool = ThreadPoolExecutor(
@@ -469,6 +470,13 @@ class StreamingSwitchGLU:
                 ):
                     continue
                 missing.append(e)
+            limit = self._max_inflight
+            if limit is not None:
+                # Speculative builds only: the queue may not outrun the
+                # budget's priced-in transient.  Demand loads
+                # (_get_bundles) are never dropped by this bound.
+                room = max(0, limit - len(self._inflight))
+                missing = missing[:room]
             for e in missing:
                 fut = self._prefetch_pool.submit(self._build, e)
                 self._inflight[e] = fut
