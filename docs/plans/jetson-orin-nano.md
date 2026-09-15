@@ -270,6 +270,13 @@ eviction-during-consumption, and the deferred pinned-slot pipeline.
 
 ## Task 6 — conditional quantized-kernel work [C14]
 
+**Scoping (15 September 2026, measured on the device):** per-op decode
+shares — `gather_qmm` 37% (69 calls/step), dense `QuantizedLinear` 26%
+(235 calls/step), everything else 37%. Both dequantization paths
+qualify. Development is handed to a workstation GPU per
+[`rtx6000-task6-handoff.md`](rtx6000-task6-handoff.md); decisions and
+acceptance stay on the Orin.
+
 Use the measured profile to choose expert gather, dense quantized linear work, or no kernel change. For an INT4 prototype, verify the actual checkpoint layout: packed words, group size, signed/negative scale behavior, bias handling, accumulation and output dtype. Pin the CUDA extension/CUTLASS/compiler combination supported by the detected Orin stack and verify runtime loading.
 
 Dispatch only supported dtype/shape/stride/transpose/group-size/device combinations to the new kernel. Keep the current implementation for unsupported cases, including 2/8-bit layouts. Test all existing broadcast and gather shapes, valid index boundaries, quantization extremes and checkpoint dtypes. Compare numerical results against both deterministic MLX fixtures and the current Torch path on Orin. Define tolerances in advance and measure scratch-memory peaks as well as speed.
