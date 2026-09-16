@@ -13,6 +13,9 @@ dist/
 # Trained adapter artifacts (never committed; see README)
 artifacts/
 
+# Downloaded checkpoints (README quick start puts them here)
+models/
+
 # macOS
 .DS_Store
 

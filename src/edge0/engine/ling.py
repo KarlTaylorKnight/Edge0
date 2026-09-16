@@ -29,8 +29,177 @@ from edge0.engine.hooks import (
 )
 from edge0.prerouter.install import install_prerouter
 from edge0.prerouter.stager import LingPrerouterStager
+from edge0.streaming import budget as _budget
+from edge0.streaming.cache import PrefetchBuffer, SharedExpertCache
 from edge0.streaming.install import install_streaming_experts
 from edge0.streaming.mmap import SafetensorsMmap
+
+
+def _apply_env_profile(cfg, opts, spec):
+    """Task 5 opt-in profile knobs, applied to the REQUESTED options
+    before the budget prices them (the budget may still lower them).
+
+    ``EDGE0_CACHE_SLOTS=<int>``: request a different shared-LRU size.
+    The tested default (64) is smaller than the per-step working set on
+    this tier (23 MoE layers x K=8 = 184 bundles), so it never hits;
+    512 measured a 65% hit rate on the Orin baseline (evidence in the
+    plan's Task 5 status).
+
+    ``EDGE0_PREDICT_PREFETCH=1``: enable
+    ``LayerOptions.predict_prefetch``; the prefetch buffer is raised to
+    hold one full predicted step (owners x K) and the per-layer
+    in-flight bound defaults to K, both priced by the budget.
+    """
+    from dataclasses import replace as _dc_replace
+    env_slots = os.environ.get("EDGE0_CACHE_SLOTS", "").strip()
+    if env_slots:
+        try:
+            slots = int(env_slots)
+        except ValueError:
+            raise ValueError(
+                f"EDGE0_CACHE_SLOTS must be an integer, got "
+                f"{env_slots!r}") from None
+        if slots <= 0:
+            raise ValueError(
+                f"EDGE0_CACHE_SLOTS must be positive, got {slots} "
+                "(0 would disable eviction, not caching)")
+        opts = _dc_replace(opts, cache_slots=slots)
+    if os.environ.get("EDGE0_PREDICT_PREFETCH", "") == "1":
+        opts = _dc_replace(opts, predict_prefetch=True)
+    if opts.predict_prefetch:
+        owners_n = len(getattr(cfg.prerouter, "owners", ()) or ())
+        per_layer = opts.top_k or spec.top_k
+        opts = _dc_replace(
+            opts,
+            prefetch_cap=max(opts.prefetch_cap, owners_n * per_layer),
+            max_inflight=opts.max_inflight or per_layer)
+    return opts
+
+
+def _torch_quant_modules():
+    """``(nn, quant)`` of the torch backend, ``(None, None)`` on MLX."""
+    from edge0.backends import backend
+    if backend.name != "cuda":
+        return None, None
+    from edge0.backends.cuda import nn as cnn
+    from edge0.backends.cuda import quant as cq
+    return cnn, cq
+
+
+def _resolve_memory_budget(cfg, opts, shards):
+    """Resolve the Task 4 memory budget when ``EDGE0_MEMORY_BUDGET`` asks
+    for one; return ``None`` when it is off (the default — behavior is
+    then exactly the pre-budget code path).
+
+    ``EDGE0_MEMORY_BUDGET`` accepts ``auto`` (observe MemAvailable and
+    any tighter address-space rlimit at this point, right before cache
+    construction) or an explicit byte count.  The declared context comes
+    from ``EDGE0_BUDGET_CONTEXT`` (tokens, default 1024): contexts
+    beyond the declaration are a different workload and must be
+    re-declared, not discovered as an OOM.
+    """
+    req = os.environ.get("EDGE0_MEMORY_BUDGET", "").strip()
+    if not req:
+        return None
+    if req == "auto":
+        import psutil
+        available = int(psutil.virtual_memory().available)
+        limit = None
+        try:
+            import resource
+            soft, _hard = resource.getrlimit(resource.RLIMIT_AS)
+            if soft not in (-1, resource.RLIM_INFINITY):
+                limit = int(soft)
+        except (ImportError, OSError, ValueError):
+            limit = None
+        obs = _budget.Observation(available_bytes=available,
+                                  process_limit_bytes=limit)
+    else:
+        try:
+            obs = _budget.Observation(available_bytes=int(req))
+        except ValueError:
+            raise _budget.BudgetError(
+                f"EDGE0_MEMORY_BUDGET must be 'auto' or a byte count, "
+                f"got {req!r}") from None
+    spec = cfg.moe_spec
+    # Layer 0 is dense on this tier; layer 1 carries the expert tensors.
+    entries = {}
+    for shard in shards:
+        entries.update(shard.entries)
+    bundle = _budget.bundle_bytes_from_entries(
+        entries, spec.key_template.format(layer=1), spec.num_experts)
+    if not cfg.kv_bytes_per_token:
+        raise _budget.BudgetError(
+            f"{cfg.name}: kv_bytes_per_token is not measured for this "
+            "tier; a memory budget cannot price the declared context")
+    context = int(os.environ.get("EDGE0_BUDGET_CONTEXT", "1024"))
+    top_k = opts.top_k or spec.top_k
+    # In-flight transient: per-layer bound x layers that can be
+    # producing at once.  With predict_prefetch every owner layer may
+    # hold a step's predictions in flight; otherwise only the thread
+    # pool's builds are outstanding.
+    per_layer_inflight = opts.max_inflight or max(1, opts.prefetch_threads)
+    if opts.predict_prefetch:
+        producing_layers = len(getattr(cfg.prerouter, "owners", ()) or ())
+        inflight_total = max(1, per_layer_inflight * producing_layers)
+    else:
+        inflight_total = per_layer_inflight
+    # The dense dequantized-weight cache: the full cache (measured 4.1 GB
+    # in float32 on the GB10; the loader now prices the actual bf16 total
+    # of this tier's QuantizedLinear modules) is only ever vetoed by the
+    # budget, never enabled; the capped cache (Task 6) is shrunk to the
+    # headroom.  The batched expert gather's per-call transient cap is
+    # deducted once when that path is on.
+    weight_cache_requested = (
+        os.environ.get("EDGE0_TORCH_WEIGHT_CACHE", "") == "1")
+    cnn, cq = _torch_quant_modules()
+    candidate_total = cnn.WEIGHT_CACHE.candidate_bytes_total() if cnn else 0
+    request = _budget.dense_cache_request(
+        full_requested=weight_cache_requested,
+        cap_bytes=cnn.WEIGHT_CACHE.cap_bytes if cnn else None,
+        candidate_total=candidate_total,
+        max_fill_transient_bytes=(
+            cnn.WEIGHT_CACHE.max_fill_transient_bytes(admitted_only=False)
+            if cnn else 0))
+    kernel_transient = int(cq.BATCHED_MAX_BYTES) if (cq and cq.BATCHED) else 0
+    resolved = _budget.resolve_budget(
+        obs,
+        _budget.ExpertFootprint(
+            bundle_bytes=bundle, num_experts=spec.num_experts,
+            num_moe_layers=23),
+        _budget.WorkloadDecl(max_context_tokens=context,
+                             kv_bytes_per_token=cfg.kv_bytes_per_token),
+        requested_cache_slots=opts.cache_slots,
+        requested_prefetch_cap=opts.prefetch_cap,
+        full_layer_prefill=opts.full_layer_prefill,
+        inflight_builds=inflight_total,
+        min_cache_slots=2 * top_k,
+        weight_cache_bytes=(request["priced_bytes"]
+                            if request["mode"] != "off" else None),
+        reserves=_budget.Reserves(kernel_transient_bytes=kernel_transient),
+        )
+    if request["mode"] == "full" and not resolved.weight_cache_permitted:
+        raise _budget.BudgetError(
+            "EDGE0_TORCH_WEIGHT_CACHE=1 rejected: the dequantized dense "
+            f"weights ({request['resident_bytes']:,} bytes resident plus a "
+            f"{request['fill_transient_bytes']:,} byte build transient) do "
+            f"not fit the resolved headroom of {resolved.headroom_bytes:,} "
+            f"bytes "
+            f"(budget: {resolved.as_dict()})")
+    if request["mode"] == "capped" and cnn is not None:
+        from dataclasses import replace as _dc_replace
+        # The policy admits each module with its own build transient, so
+        # the effective cap is the headroom itself.
+        effective = _budget.effective_capped_bytes(
+            cap_bytes=request["cap_bytes"],
+            headroom_bytes=resolved.headroom_bytes)
+        summary = cnn.WEIGHT_CACHE.finalize(effective)
+        resolved = _dc_replace(resolved, notes=resolved.notes + (
+            f"capped weight cache: requested {request['cap_bytes']:,} B, "
+            f"effective {effective:,} B, admitted "
+            f"{summary['admitted_bytes']:,} B in "
+            f"{len(summary['admitted'])} modules",))
+    return resolved
 
 
 def _get_model_classes(config):
@@ -65,8 +234,33 @@ def load_installed(model_dir: str, cfg):
     spec = cfg.moe_spec
     opts = cfg.options
     n_layers = model_config["num_hidden_layers"]
+    opts = _apply_env_profile(cfg, opts, spec)
+    resolved_budget = _resolve_memory_budget(cfg, opts, shards)
+    shared_cache = prefetch_buffer = None
+    if resolved_budget is not None:
+        from dataclasses import replace as _dc_replace
+        # cache/prefetch capacities come from the budget; the in-flight
+        # bound stays PER-LAYER (the budget priced the total across
+        # producing layers, see _resolve_memory_budget).
+        opts = _dc_replace(
+            opts, cache_slots=resolved_budget.cache_slots,
+            prefetch_cap=resolved_budget.prefetch_cap,
+            max_inflight=(opts.max_inflight
+                          or max(1, opts.prefetch_threads)))
+        shared_cache = SharedExpertCache(resolved_budget.cache_slots)
+        prefetch_buffer = PrefetchBuffer(
+            resolved_budget.prefetch_cap,
+            max_cap=resolved_budget.max_prefetch_cap)
+        print(f"[edge0-8b] memory budget: usable="
+              f"{resolved_budget.usable_bytes:,}B cache_slots="
+              f"{resolved_budget.cache_slots} prefetch_cap="
+              f"{resolved_budget.prefetch_cap} headroom="
+              f"{resolved_budget.headroom_bytes:,}B"
+              + (f" notes={list(resolved_budget.notes)}"
+                 if resolved_budget.notes else ""), flush=True)
     installed = install_streaming_experts(
-        model, shards, spec, options=opts, num_layers=n_layers)
+        model, shards, spec, options=opts, num_layers=n_layers,
+        shared_cache=shared_cache, prefetch_buffer=prefetch_buffer)
     all_stream = {li: t for li, t in enumerate(installed) if t is not None}
     stream_layers = {li: t for li, t in all_stream.items() if t._staged_mode}
 
@@ -78,16 +272,22 @@ def load_installed(model_dir: str, cfg):
     if cfg.prerouter and cfg.prerouter.weights_file:
         pg_state, heads = install_prerouter(
             model=model, spec=spec, pspec=cfg.prerouter, n_layers=n_layers)
+        prefetch_layers = None
+        if opts.predict_prefetch:
+            prefetch_layers = {li: t for li, t in all_stream.items()
+                               if not t._staged_mode}
         pg_stager = LingPrerouterStager(
             model=model, spec=spec, pspec=cfg.prerouter,
             state=pg_state, stream_layers=stream_layers,
-            top_k=cfg.prerouter_top_k)
+            top_k=cfg.prerouter_top_k,
+            prefetch_layers=prefetch_layers)
         print(f"[edge0-8b] prerouter installed: {len(heads)} heads, "
               f"start={cfg.prerouter.start_layer}, "
               f"K={cfg.prerouter_top_k}", flush=True)
     installs = dict(all_stream_layers=all_stream,
                     stream_layers=stream_layers,
-                    pg_state=pg_state, pg_stager=pg_stager)
+                    pg_state=pg_state, pg_stager=pg_stager,
+                    memory_budget=resolved_budget)
     return model, model_config, shards, installs
 
 
@@ -118,6 +318,9 @@ class Ling8BEngine(Edge0Engine):
         self._stream_layers = inst["stream_layers"]
         self._pg_state = inst["pg_state"]
         self._pg_stager = inst["pg_stager"]
+        #: Resolved Task 4 memory budget (None when EDGE0_MEMORY_BUDGET
+        #: is off); the bench report's caches group records it.
+        self.memory_budget = inst["memory_budget"]
         opts = cfg.options
         if self._tok is None:
             try:

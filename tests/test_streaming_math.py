@@ -11,13 +11,15 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-import mlx.core as mx
-import mlx.nn as nn
-from safetensors.numpy import save_file
 
-from edge0.moe.spec import MoESpec, QuantSpec, WeightLayout
-from edge0.streaming.cache import SharedExpertCache
-from edge0.streaming.layer import StreamingSwitchGLU
+mx = pytest.importorskip("mlx.core")
+nn = pytest.importorskip("mlx.nn")
+
+from safetensors.numpy import save_file  # noqa: E402
+
+from edge0.moe.spec import MoESpec, QuantSpec, WeightLayout  # noqa: E402
+from edge0.streaming.cache import SharedExpertCache  # noqa: E402
+from edge0.streaming.layer import StreamingSwitchGLU  # noqa: E402
 from edge0.streaming.mmap import SafetensorsMmap
 from edge0.streaming.options import LayerOptions
 

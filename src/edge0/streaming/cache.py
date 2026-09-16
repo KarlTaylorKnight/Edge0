@@ -56,10 +56,21 @@ class PrefetchBuffer:
     it (it is then promoted into the shared LRU by the caller).
     """
 
-    def __init__(self, cap: int = 48):
-        self.cap = max(0, cap)
+    def __init__(self, cap: int = 48, max_cap: int | None = None):
+        # ``max_cap`` is a hard ceiling for later ``set_cap`` growth
+        # (``prefetch_all`` raises the cap to num_experts + 32 on its
+        # own); a memory budget passes the ceiling it priced in.  None
+        # keeps the historical unbounded-growth semantics.
+        self.max_cap = max_cap
+        self.cap = self._clamp(cap)
         self._buf = OrderedDict()
         self._lock = threading.Lock()
+
+    def _clamp(self, cap: int) -> int:
+        cap = max(0, cap)
+        if self.max_cap is not None:
+            cap = min(cap, self.max_cap)
+        return cap
 
     def put(self, key, bundle):
         with self._lock:
@@ -78,4 +89,4 @@ class PrefetchBuffer:
             return key in self._buf
 
     def set_cap(self, cap: int):
-        self.cap = max(0, cap)
+        self.cap = self._clamp(cap)

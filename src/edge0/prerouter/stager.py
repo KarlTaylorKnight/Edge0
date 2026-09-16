@@ -65,12 +65,17 @@ class PrerouterStager:
         state: PrerouterState,
         stream_layers: dict[int, StreamingSwitchGLU],
         top_k: int,
+        prefetch_layers: dict[int, StreamingSwitchGLU] | None = None,
     ):
         self.model = model
         self.spec = spec
         self.pspec = pspec
         self.state = state
         self.stream_layers = stream_layers
+        #: Non-staged layers whose predicted expert sets are routed to
+        #: ``prefetch()`` (LayerOptions.predict_prefetch).  Scheduling
+        #: only: the exact consumption path is untouched.
+        self.prefetch_layers = prefetch_layers or {}
         self.top_k = top_k
         self.num_experts = spec.num_experts
         self.records: list | None = None
@@ -190,10 +195,12 @@ class LingPrerouterStager(PrerouterStager):
 
     def __init__(self, *, model, spec: MoESpec, pspec: PrerouterSpec,
                  state: PrerouterState,
-                 stream_layers: dict[int, StreamingSwitchGLU], top_k: int):
+                 stream_layers: dict[int, StreamingSwitchGLU], top_k: int,
+                 prefetch_layers: dict[int, StreamingSwitchGLU]
+                 | None = None):
         super().__init__(model=model, spec=spec, pspec=pspec,
                          state=state, stream_layers=stream_layers,
-                         top_k=top_k)
+                         top_k=top_k, prefetch_layers=prefetch_layers)
         self.pg_cache: dict[int, core.array] = {}
 
     def _head_of(self, owner: int):
@@ -232,6 +239,15 @@ class LingPrerouterStager(PrerouterStager):
         exp = self.stream_layers.get(consumer)
         if exp is not None:
             exp.stage_experts(experts)
+            return
+        # Non-staged consumer (prod profiles): overlap the predicted
+        # next-step builds with the current forward.  prefetch() is
+        # bounded (max_inflight / prefetch buffer caps) and consumption
+        # stays on the exact _get_bundles path — a wrong or late
+        # prediction is just a demand load, never a zero row.
+        pre = self.prefetch_layers.get(consumer)
+        if pre is not None:
+            pre.prefetch(experts)
 
     def _note(self, owner: int, cur_oh) -> None:
         block = self.spec.block_of(self.model, owner)
