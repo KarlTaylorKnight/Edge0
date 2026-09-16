@@ -18,17 +18,27 @@ Semantics match ``mx.gather_qmm`` as checked against real MLX 0.30.4
 
 Two implementations share those semantics:
 
-* the reference loop (default): one distinct expert at a time, each
-  dequantized in full to float32 and multiplied -- correct, testable,
-  and the one every other path is compared against;
-* ``EDGE0_QMM_BATCHED=1`` (Task 6, opt-in): the same float32 arithmetic
-  with ONE dequantization over the distinct experts and ONE batched
-  matmul over a padded per-expert slab, instead of a python loop of
-  ``len(unique)`` dequantize+matmul pairs.  Only affine 4-bit takes it;
-  2/8-bit layouts and any call whose priced transient exceeds
-  ``EDGE0_QMM_BATCHED_MAX_BYTES`` (default 256 MiB) fall through to the
-  reference loop.  The transient is bounded and priced
-  (``batched_transient_bytes``) so the Task 4 budget can deduct it.
+* the reference loop: one distinct expert at a time, each dequantized in
+  full to float32 and multiplied -- correct, testable, and the one every
+  other path is compared against.  ``EDGE0_QMM_BATCHED=0`` selects it;
+* the batched path (Task 6, **default on this backend**): the same
+  float32 arithmetic with ONE dequantization over the distinct experts
+  and ONE batched matmul over a padded per-expert slab, instead of a
+  python loop of ``len(unique)`` dequantize+matmul pairs.  Only affine
+  4-bit takes it; 2/8-bit layouts and any call whose priced transient
+  exceeds ``EDGE0_QMM_BATCHED_MAX_BYTES`` (default 256 MiB) fall through
+  to the reference loop.  The transient is bounded and priced
+  (``batched_transient_bytes``) so the Task 4 budget deducts it.
+
+The default was flipped on the Orin's Task 6 acceptance evidence, which
+is what Gate D asks for before a path becomes default: measured benefit
+on the target (decode +21%, three independent launches) plus the
+pre-registered 32-token reference check PASSING there (32/32 token
+choices identical, max |delta logit| 0.777 against the registered bound
+of 1.0) -- and a second GPU generation agreeing in direction (+59% on an
+RTX PRO 6000).  The arithmetic is the same expression per element; it
+lands within one bfloat16 ulp of the reference loop at the real decode
+shapes, which is why the check passes rather than merely not crashing.
 """
 
 from __future__ import annotations
@@ -43,7 +53,11 @@ DEFAULT_BATCHED_MAX_BYTES = 256 << 20
 
 
 def _read_batched_gate() -> bool:
-    return os.environ.get(BATCHED_ENV, "") == "1"
+    """On by default (see the module docstring for the evidence that
+    flipped it); ``EDGE0_QMM_BATCHED=0`` selects the reference loop.
+    Any other value is treated as unset, so a typo cannot silently
+    change the path."""
+    return os.environ.get(BATCHED_ENV, "").strip() != "0"
 
 
 def _read_batched_max_bytes() -> int:

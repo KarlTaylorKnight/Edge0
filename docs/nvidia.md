@@ -143,17 +143,20 @@ resident, inside the resolved budget.  Off by default until the
 post-Task-6 re-measurement; the pinned-buffer CUDA-stream pipeline is
 deferred on the same evidence (see the plan's Task 5 status).
 
-### Opt-in quantized paths (Task 6, developed on a workstation GPU)
+### Quantized paths (Task 6, developed on a workstation GPU)
 
 The Orin profile (plan Task 6 scoping) put 37% of a decode step in
 `quant.gather_qmm` and 26% in the dense `QuantizedLinear.forward`, both
-dequantize-then-matmul.  Three opt-in paths were developed and parity-tested
+dequantize-then-matmul.  Three paths were developed and parity-tested
 on an RTX PRO 6000 (torch 2.14.0+cu130, the Orin's torch version) per
 [`plans/rtx6000-task6-handoff.md`](plans/rtx6000-task6-handoff.md).  All are
-**off by default**, guarded (every unsupported case falls through to the
-reference implementation unchanged), priced for the Task 4 budget and
+guarded (every unsupported case falls through to the reference
+implementation unchanged), priced for the Task 4 budget and
 recorded in the bench report's `caches.quant_paths` group.  Which one the
-Orin adopts, and any tok/s, is decided on the Orin.
+Orin adopts, and any tok/s, is decided on the Orin — see
+[the acceptance](#task-6-orin-acceptance) below, which made
+`EDGE0_QMM_BATCHED` the **default** on this backend and left the two
+dense knobs opt-in.
 
 | Knob | What it does | Exact? | Extra memory |
 |---|---|---|---|
@@ -197,6 +200,81 @@ session: WSL Ubuntu nvcc 13.0.88 + g++ 13.3 compile
 `-gencode arch=compute_87,code=sm_87 -gencode arch=compute_120,code=sm_120`
 fat binaries that run on this GPU; Windows has VS 2022 BuildTools + CUDA
 12.8 as an alternative.
+
+### Task 6 Orin acceptance
+
+Run on the target (Orin Nano 8 GB, L4T R39.2, CUDA 13.2, torch
+2.14.0+cu130, 25W, budget active) on 16 September 2026.  Same workload
+and instrumentation as the Task 3 baseline: 37-token prompt, 32 greedy
+tokens, `BENCH_TEMP=0 BENCH_SEED=0`, three independent launches x two
+internal runs, tegrastats alongside.
+
+**Environment and correctness.** Full suite 341 passed on-device; the
+CUDA suites pass under `--require-cuda` (96 tests).  `int4pack.probe`
+**executes on sm_87** — the kernel the wheel's SASS list does not
+advertise runs here, answered by execution as the design intended.
+
+Same-device 32-token reference checks (`--test-env`, so the only
+variable is the knob; the registered bound is Task 3's max |Δlogit| ≤ 1.0):
+
+| Path | Token choices | max abs logit diff | Verdict |
+|---|---|---|---|
+| `EDGE0_QMM_BATCHED=1` | 32/32 identical | **0.777** | **PASS** |
+| `EDGE0_TORCH_WEIGHT_CACHE_BYTES=1.5e9` | 32/32 identical | 1.58 | FAIL of that bound, recorded |
+| `EDGE0_INT4PACK=1` | 32/32 identical | 2.17 | FAIL of that bound, recorded |
+
+**Decode (6 runs each, mean ± sd):**
+
+| Configuration | decode tok/s | mean | vs baseline | CUDA peak / RSS |
+|---|---|---|---|---|
+| baseline (Task 3) | 0.530–0.580 | 0.553 | — | 1.00 / 5.3–5.8 GiB |
+| batched gather | 0.623–0.699 | **0.668** | **+20.7%** | 1.00 / 5.6–5.7 GiB |
+| batched + Task 5 knobs | 0.743–0.815 | **0.785** | **+41.8%** | 1.58 / 5.8–5.9 GiB |
+| capped weight cache (screen) | 0.517 | 0.517 | +0.8% | 1.16 GiB |
+| int4 kernel (screen) | 0.524–0.540 | 0.532 | +3.7% | 1.07 GiB |
+
+**Decision.** `EDGE0_QMM_BATCHED` is now **on by default** on this
+backend (`EDGE0_QMM_BATCHED=0` selects the reference loop): it is the
+only path that both passed the registered correctness bound on the
+target and delivered a measured benefit there, it engages on every
+gather call, its transient is bounded and the budget deducts the cap.
+The two dense knobs stay **opt-in**: they move decode by ~1–4% because
+of the dtype gate below, and both exceed the registered bound.
+
+**The Task 5 re-measurement Gate D asked for.** With compute reduced,
+transfers matter more, exactly as predicted: the Task 5 knobs were worth
++7.7% before Task 6 and are worth **+17.5% on top of the batched gather**
+now (0.668 → 0.785), with expert load wall falling 72.5 s → 17.0 s over
+the same six runs and 30,159 cache hits against 5,169 loads.  They remain
+opt-in because they are board-specific tuning that needs the budget
+active (`EDGE0_MEMORY_BUDGET=auto EDGE0_CACHE_SLOTS=512
+EDGE0_PREDICT_PREFETCH=1` is the recommended Orin profile, and is what
+the 0.785 figure uses).
+
+**Two corrections to the workstation's report, found only by running here:**
+
+1. *The capped weight cache is not bit-identical on this GPU.*  The
+   workstation measured max |Δlogit| exactly 0; the Orin measures 1.58.
+   Isolated: the cached dequantized weight IS bit-identical to the
+   chunked path's (verified directly), but feeding those same weights
+   through one GEMM versus the reference's per-4096-row GEMMs differs by
+   0.03125 on a 30.6 output scale — one bf16 ulp of accumulation-order
+   difference in cuBLAS's kernel choice for the two shapes.  The
+   exactness claim is a property of the workstation's cuBLAS heuristics,
+   not of the code; on sm_87 the path is exact in the weights and
+   near-exact in the outputs.
+2. *The float32 activation gate is an MLA/RoPE promotion, not an
+   accident.*  Confirmed here (35 bf16 vs 200 float32 dense calls per
+   decode step) and traced to its origin: layer 3 is the first
+   `BailingMLA`, whose RoPE path computes in float32 and concatenates
+   `q_nope.to(q_pe.dtype)` with the float32 `q_pe` — deliberate MLX
+   promotion parity, commented as such in the vendored model.  From that
+   layer on, the residual stream stays float32, so only layers 0–2 (KDA)
+   present bf16 activations to their dense linears.  That is the 35
+   modules, and it is a numerics-parity decision, not a kernel
+   limitation: reaching the rest of the dense 26% means deciding to
+   diverge from MLX's promotion in the MLA path, which belongs in review
+   with its own reference check, not in a kernel increment.
 
 ## Benchmark reporting
 

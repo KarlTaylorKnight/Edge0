@@ -310,6 +310,54 @@ Dispatch only supported dtype/shape/stride/transpose/group-size/device combinati
 
 A fused expert gather does not remove dense `QuantizedLinear` dequantization. If dense work remains dominant, handle it as its own bounded, parity-tested change or document the residual cost. Gate D does not require eliminating all model allocations.
 
+**Status — ACCEPTED ON THE DEVICE (16 September 2026).** Orin Nano 8 GB,
+same workload and instrumentation as the Task 3 baseline, budget active,
+three launches x two runs per configuration; sanitized tables in
+`docs/nvidia.md` (Task 6 Orin acceptance), raw reports in the evidence
+set.  Suite 341 passed on-device, 96 under `--require-cuda`.
+
+*Adopted:* the batched expert gather is now the **default** on the CUDA
+backend (`EDGE0_QMM_BATCHED=0` selects the reference loop).  It is the
+only candidate that both PASSED the registered 32-token reference bound
+on the target (32/32 token choices, max |Δlogit| 0.777 vs the bound of
+1.0) and delivered a measured benefit there: decode 0.623–0.699,
+mean **0.668 tok/s, +20.7%** over the 0.553 baseline, at unchanged CUDA
+peak (1.00 GiB) and RSS.  Its transient is bounded and the budget
+deducts the cap (verified in the report: `kernel_transient` 268,435,456
+with no env var set).  `int4pack.probe` executes on sm_87 — the kernel
+runs on hardware the wheel's SASS list does not advertise, decided by
+execution as designed.
+
+*Not adopted (kept opt-in):* the capped weight cache (+0.8%) and the
+int4 kernel (+3.7%), both because the activation-dtype gate limits them
+to 35 of 235 modules, and both exceed the registered bound (1.58 and
+2.17) — recorded as that bound's failures, not loosened.
+
+*Gate D's Task 5 re-measurement:* with compute reduced the transfer
+knobs are worth much more than before — +7.7% pre-Task-6, **+17.5% on
+top of the batched gather** now (0.668 → 0.785 tok/s, expert load wall
+72.5 s → 17.0 s over the same six runs).  `EDGE0_MEMORY_BUDGET=auto
+EDGE0_CACHE_SLOTS=512 EDGE0_PREDICT_PREFETCH=1` is the recommended Orin
+profile and stays opt-in as board-specific tuning that requires the
+budget.  End to end the tier now runs at **0.785 tok/s, +42% over the
+Task 3 baseline**, inside the resolved budget with no OOM.
+
+*Two workstation claims corrected here, both only visible on the target:*
+the capped weight cache is NOT bit-identical on sm_87 — the cached
+weights are, but one GEMM versus the reference's per-chunk GEMMs differs
+by one bf16 ulp of accumulation order (isolated directly: same weights,
+0.03125 on a 30.6 scale), so that exactness was a property of the
+workstation's cuBLAS heuristics; and the float32 activation gate is
+deliberate MLX promotion parity in the MLA/RoPE path (layer 3 is the
+first `BailingMLA`; the residual stream is float32 from there on), so
+reaching the remaining dense 26% is a numerics-parity decision for
+review, not a kernel increment.
+
+*Open for a later increment:* design C (custom fused kernel) remains
+unwritten with its toolchain recorded; the MLA float32 promotion
+question; and the deferred pinned-slot transfer pipeline from Task 5,
+which is now more attractive than it was at the compute-bound baseline.
+
 ## Task 7 — final validation and evidence [C15, C16]
 
 Repeat the identical workload manifest using at least three independent launches. Retain individual prefill/decode results, explain first-versus-repeated-run state, and report sample count, mean, standard deviation and min/max separately. Treat the small sample as descriptive evidence rather than a broad performance guarantee.

@@ -103,13 +103,19 @@ def reference_spy(monkeypatch):
 # ---- gate ------------------------------------------------------------------------
 
 
-def test_batched_gate_is_off_unless_requested(monkeypatch):
+def test_batched_gate_is_on_unless_disabled(monkeypatch):
+    """Default flipped on the Orin's Task 6 acceptance (decode +21% on the
+    target, reference check PASSING the registered bound); ``0`` selects
+    the reference loop and any other value is treated as unset, so a typo
+    cannot silently pick a path."""
     monkeypatch.delenv("EDGE0_QMM_BATCHED", raising=False)
+    assert cq._read_batched_gate() is True
+    monkeypatch.setenv("EDGE0_QMM_BATCHED", "0")
     assert cq._read_batched_gate() is False
     monkeypatch.setenv("EDGE0_QMM_BATCHED", "1")
     assert cq._read_batched_gate() is True
-    monkeypatch.setenv("EDGE0_QMM_BATCHED", "yes")
-    assert cq._read_batched_gate() is False
+    monkeypatch.setenv("EDGE0_QMM_BATCHED", "no")
+    assert cq._read_batched_gate() is True
     assert cq.DEFAULT_BATCHED_MAX_BYTES == 256 << 20
     monkeypatch.setenv("EDGE0_QMM_BATCHED_MAX_BYTES", "1024")
     assert cq._read_batched_max_bytes() == 1024
@@ -118,13 +124,22 @@ def test_batched_gate_is_off_unless_requested(monkeypatch):
         cq._read_batched_max_bytes()
 
 
-def test_reference_path_is_the_default(reference_spy):
-    assert cq.BATCHED is False
+def test_reference_path_is_selectable_and_2bit_still_falls_through(
+        reference_spy, monkeypatch):
+    """``EDGE0_QMM_BATCHED=0`` reaches the reference loop, and a layout the
+    batched path does not cover falls through to it even when the (now
+    default-on) gate is set."""
     codes, packed, s, b = _quantized(0)
     x = torch.randn(3, D)
+    monkeypatch.setattr(cq, "BATCHED", False)
     cq.gather_qmm(x, packed, s, b, torch.tensor([1, 2, 3]), transpose=True,
                   group_size=GS, bits=4)
     assert reference_spy == [1]
+    monkeypatch.setattr(cq, "BATCHED", True)
+    codes2, packed2, s2, b2 = _quantized(0, bits=2)
+    cq.gather_qmm(x, packed2, s2, b2, torch.tensor([1, 2, 3]), transpose=True,
+                  group_size=GS, bits=2)
+    assert reference_spy == [1, 1]
 
 
 # ---- batched gather: parity ------------------------------------------------------
