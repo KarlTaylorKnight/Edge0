@@ -69,10 +69,19 @@ class Ling8BConfig(ModelConfig):
             port=8083,
             target_tok_s=33.0,
             peak_active_mem_mb=1400.0,
-            # README benchmark: ~3.3 GiB of KV at 3.3k context on this
-            # tier (~1.05 MB/token, fp16 — dims, not backend, set this);
-            # rounded up for the budget arithmetic.
-            kv_bytes_per_token=1_100_000,
+            # MEASURED on the torch backend (Orin, Task 7): the marginal
+            # cost between 1536 and 2048 tokens is 561,320 B/token
+            # (548 KiB), recorded in the evidence set; 600,000 keeps ~7%
+            # margin.  Growth is sublinear below that — most layers of
+            # this hybrid are KDA, whose state is fixed-size, so only the
+            # MLA layers' KV grows with context — which is why the
+            # marginal slope at the top of the range is the right
+            # constant to extrapolate a declared context from.
+            # The previous 1,100,000 came from the README's Apple/MLX
+            # figure and over-reserved by ~2x, rejecting contexts that
+            # fit.  Over-reserving is safe but shrinks the envelope, so
+            # it is corrected from the measurement, not from the doc.
+            kv_bytes_per_token=600_000,
         )
 
 

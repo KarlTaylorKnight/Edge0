@@ -2,13 +2,21 @@
 
 ## Jetson Orin Nano bring-up
 
-**Status (14 September 2026): edge0-8b runs on a physical Orin Nano 8 GB.**
-The unoptimized torch reference path generated coherent 32-token greedy
-output on the device's GPU, with every token choice identical to the
-torch-CPU reference on the same board.  The claim is qualified to the
-tested workload (37-token chat-templated prompt, 32 greedy tokens,
-weight cache and prewarm off) and to what the correctness gate below
-actually shows — see [Task 3 baseline](#task-3-orin-baseline-summary).
+**Status (16 September 2026): edge0-8b runs on a physical Orin Nano 8 GB,
+and the bring-up plan is complete through its final validation.**
+Decode **0.77–0.82 tok/s**, prefill 42 tok/s at a 3.3k-token prompt,
+inside a byte budget that rejects what will not fit before the model
+loads, with token choices matching the reference implementation on this
+device.  The claim covers exactly the board, build, checkpoint, profile
+and workloads in the [tested operating
+envelope](#tested-operating-envelope-task-7-final-validation): single
+request, greedy sampling, ≤ 4096 declared context, ≤ 256 validated
+generation, 25W mode.  The route there is the
+[Task 3 baseline](#task-3-orin-baseline-summary) (0.553 tok/s
+unoptimized), the [byte budget](#memory-budgeted-profile-task-4), the
+[transfer knobs](#bounded-expert-reuse-and-predicted-prefetch-task-5-opt-in)
+and the [quantized paths](#task-6-orin-acceptance) — **+42% end to end**
+over the baseline.
 
 Before attempting inference on an Orin Nano, capture a machine-readable
 capability report with the read-only probe:
@@ -275,6 +283,74 @@ the 0.785 figure uses).
    limitation: reaching the rest of the dense 26% means deciding to
    diverge from MLX's promotion in the MLA path, which belongs in review
    with its own reference check, not in a kernel increment.
+
+### Tested operating envelope (Task 7 final validation)
+
+Everything below was measured on the target on 16 September 2026.  It
+describes **this** board, build, checkpoint and profile on the workloads
+listed; it is descriptive evidence from small samples, not a performance
+guarantee, and nothing here is claimed for other Orin models, power
+modes or context lengths.
+
+**Configuration under test.** Jetson Orin Nano Developer Kit (Super),
+8 GB (7.85 GB observed), NVMe/ext4, L4T R39.2 (kernel 6.8.12-tegra),
+CUDA 13.2 driver, 25W power mode (observed, unchanged), Python 3.12.3,
+torch 2.14.0+cu130, no MLX installed.  Checkpoint
+`Edge0/Edge0-8B-A1B-preview`, manifest sha256 `a83dee78…`, with its
+bundled LoRA and prerouter adapters.  Profile: the shipped default
+(batched expert gather on) plus `EDGE0_MEMORY_BUDGET=auto
+EDGE0_CACHE_SLOTS=512 EDGE0_PREDICT_PREFETCH=1`.  A desktop session
+(~3.5 GB) was resident throughout — this is the realistic condition on
+this board, not a cleared one.
+
+| Dimension | Tested envelope |
+|---|---|
+| Decode, short prompt | 0.744–0.786 tok/s, mean **0.772**, sd 0.016 (n=6: three launches x two runs) |
+| Decode, sustained | mean **0.817** tok/s, sd 0.028, min 0.745, max 0.853 (30 requests / 960 tokens / 25 min, one process) |
+| Prefill | 13.6–15.6 s at 37 tokens; **42.4–42.8 tok/s** at 3292 tokens |
+| Generation length | validated to **256 tokens** in one request (0.807 / 0.820 tok/s over two runs — no decay with generation length) |
+| Prompt / context | validated at **3292 prompt tokens**; the budget admits up to a **4096-token declared context** on this board, and rejects beyond that before loading |
+| Memory | CUDA allocator peak 1.58 GiB short-prompt, 3.14 GiB at 3292 tokens; process RSS 5.45–5.82 GiB |
+| Thermal | junction 54.5–61.8 °C over 25 minutes, **no throttling**; GPU busy in 749 of 774 samples |
+| Correctness | 32/32 token choices identical to the reference loop, max abs logit diff **0.777** against the registered bound of 1.0 (PASS); all 30 sustained requests produced byte-identical tokens |
+
+**KV growth was measured, not inherited.**  `kv_bytes_per_token` for
+this tier was 1,100,000 — the README's Apple/MLX figure.  Measured here
+across 128…2048-token prefills, the marginal cost is **561,320 B/token
+(548 KiB)**, roughly half of that; growth is sublinear below the top of
+the range because most layers of this hybrid are KDA, whose state is
+fixed-size, so only the MLA layers' KV grows with context.  The constant
+is now 600,000 (≈7% margin over the measurement).  The practical effect
+is a larger honest envelope: the declared context the budget admits on
+this board goes from ~2560 to 4096 tokens.  Over-reserving was safe but
+was rejecting contexts that fit.
+
+**Repeated requests are stable, and the RSS movement is not a leak.**
+Across 30 sequential requests RSS moved between 5.45 and 5.70 GiB,
+rising *and falling* (5.45 → 5.65 → 5.53 → 5.70 → 5.69): mmapped expert
+pages being reclaimed and re-faulted under memory pressure, which is
+what RSS counting mmapped files looks like, not monotonic growth.  CUDA
+allocator peaks were flat at 1.57 GiB and every request produced
+identical tokens.
+
+**Swap, stated explicitly.**  The sustained run *did* swap: +1,165 MB in
+the first fifth of the run, then flat (+24, 0, +18, −2 MB across the
+remaining four fifths), with no throughput degradation — in fact the
+later quartiles were slightly faster (0.791 / 0.834 / 0.816 / 0.824).
+That profile is a one-time eviction of the resident desktop's idle pages
+to make room, not the model's working set thrashing.  Per the plan's
+rule a swapping run cannot establish a resident-memory target, so the
+memory figures above are stated as observed peaks under these
+conditions, and a swap-free claim is **not** made for a board with a
+desktop session resident.
+
+**Known limitations of this envelope.**  Single concurrent request only
+(no batching, no concurrent sessions tested).  Greedy sampling at
+temperature 0 for every measurement.  Contexts beyond 4096 declared
+tokens are rejected by the budget, not degraded gracefully.  Prefill at
+short prompts is dominated by fixed overhead (2–3 tok/s at 37 tokens vs
+42 tok/s at 3292) and was not optimized.  edge0-35b remains out of scope
+on this board.
 
 ## Benchmark reporting
 

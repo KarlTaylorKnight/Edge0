@@ -365,3 +365,63 @@ Repeat the identical workload manifest using at least three independent launches
 Repeat correctness, maximum declared context/generation, memory pressure and repeated-request checks, plus a declared sustained-run test long enough to expose thermal behavior. Capture failures and throttling. State the tested operating envelope: exact board/software/checkpoint/profile, context limits, memory reserve and remaining limitations.
 
 Only claim physical Orin inference once Gate B passes, and qualify the claim to its tested workload. Claim the bounded profile or optimization only after its own gates pass. Commit reviewed code/tests/docs and sanitized result summaries; keep raw benchmarks, telemetry, private paths, identifiers and checkpoints in the separate evidence set. Small reviewed deterministic test fixtures are test assets, not raw benchmark dumps.
+
+**Status — COMPLETE (16 September 2026).**  The tested operating
+envelope is stated in `docs/nvidia.md`; raw reports, telemetry logs and
+the npz logit captures stay in the untracked evidence set.
+
+*Repeat measurement.*  Final adopted profile, three independent launches
+x two runs: decode 0.744–0.786 tok/s, **mean 0.772, sd 0.016** (n=6),
+prefill 13.6–15.6 s, CUDA peak 1.58 GiB, RSS 5.57–5.69 GiB.  Reported as
+descriptive statistics of a small sample, not a guarantee.
+
+*Correctness repeat.*  Same-device 32-token reference check of the final
+profile against the reference loop: **PASS**, 32/32 token choices
+identical, max |Δlogit| 0.777 against the registered bound of 1.0.  All
+30 requests of the sustained run produced byte-identical tokens.
+
+*Maximum declared context and generation.*  KV growth was MEASURED here
+rather than inherited: the marginal cost is 561,320 B/token (548 KiB),
+about half the 1,100,000 taken from the README's Apple/MLX figure, so
+`kv_bytes_per_token` for this tier is corrected to 600,000 (≈7% margin).
+Growth is sublinear below the top of the range because most layers of
+this hybrid are KDA with fixed-size state; only the MLA layers' KV grows
+with context, which is why the top-of-range marginal slope is the right
+constant to extrapolate from.  With it the budget admits a **4096-token
+declared context** on this board (it admitted ~2560 before), validated
+by a real 3292-token prompt run: prefill 42.4–42.8 tok/s, decode
+0.72–0.81 tok/s, CUDA peak 3.14 GiB, RSS 5.8 GiB, no OOM, 39 MB of
+resolved headroom at a 3584-token declaration.  Generation validated to
+**256 tokens** in one request (0.807 / 0.820 tok/s — no decay with
+length).
+
+*Memory pressure, repeated requests, sustained run.*  30 sequential
+requests in one process over 25 minutes (960 tokens): decode mean
+**0.817 tok/s**, sd 0.028, quartile means 0.791 / 0.834 / 0.816 / 0.824
+— no degradation over time.  Junction temperature 54.5–61.8 °C with
+**no throttling** (GPU busy in 749 of 774 samples).  RSS moved between
+5.45 and 5.70 GiB, rising and falling rather than growing monotonically:
+mmapped expert pages reclaimed and re-faulted, not a leak; CUDA
+allocator peaks flat at 1.57 GiB.
+
+*Swap, marked explicitly.*  The sustained run DID swap: +1,165 MB during
+the first fifth, then flat (+24, 0, +18, −2 MB), with no throughput
+loss.  That is a one-time eviction of the resident desktop session's
+idle pages, not the model's working set thrashing — but per Gate C a
+swapping run cannot establish a resident-memory target, so no swap-free
+claim is made for this board with a desktop resident.
+
+*The claim, qualified.*  edge0-8b runs on a physical Jetson Orin Nano
+8 GB at **0.77–0.82 tok/s decode**, 42 tok/s prefill at 3.3k tokens,
+within a byte budget that rejects what does not fit before loading, with
+token choices matching the reference implementation on this device.  The
+claim covers exactly the board, build, checkpoint, profile and workloads
+above: single request, greedy sampling, ≤ 4096 declared context, ≤ 256
+validated generation, 25W mode, desktop resident.
+
+*Remaining, none of it blocking:* design C (custom fused kernel,
+toolchain recorded); the MLA float32 promotion question that gates the
+dense 26%; the deferred pinned-slot transfer pipeline; concurrent /
+batched requests, which were never in scope here; and short-prompt
+prefill overhead (2–3 tok/s at 37 tokens against 42 tok/s at 3292),
+which no increment targeted.
